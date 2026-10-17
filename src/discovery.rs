@@ -99,6 +99,7 @@ pub struct Discovery {
     extensions: String,
     threads: usize,
     hide_404: bool,
+    use_cookies: bool,
     recursive: bool,
     max_depth: usize,
     queue: VecDeque<(String, usize)>,
@@ -124,6 +125,7 @@ impl Default for Discovery {
             extensions: String::new(),
             threads: 20,
             hide_404: true,
+            use_cookies: false,
             recursive: false,
             max_depth: 2,
             queue: VecDeque::new(),
@@ -252,6 +254,7 @@ impl Discovery {
             .collect();
         let (tx, ui, target, upstream) = (env.tx.clone(), env.egui.clone(), self.target.clone(), env.upstream());
         let (run, threads) = (self.run, self.threads.max(1));
+        let session = env.session(self.use_cookies);
         env.rt.spawn(async move {
             let limit = Arc::new(tokio::sync::Semaphore::new(threads));
             for (idx, raw) in requests {
@@ -260,8 +263,9 @@ impl Discovery {
                     break;
                 }
                 let (tx, ui, target, upstream) = (tx.clone(), ui.clone(), target.clone(), upstream.clone());
+                let session = session.clone();
                 tokio::spawn(async move {
-                    let result = http::send(&target, &raw, &upstream).await;
+                    let (raw, result) = session.send(&target, &raw, &upstream).await;
                     let _ = tx.send(Event::Log(crate::logger::entry("Discovery", &target, &raw, &result)));
                     let _ = tx.send(Event::Discovery { run, idx, result });
                     ui.request_repaint();
@@ -308,6 +312,7 @@ impl Discovery {
             ui.label("Extensions");
             ui.add(egui::TextEdit::singleline(&mut self.extensions).hint_text("php, html, bak").desired_width(160.0));
             ui.checkbox(&mut self.hide_404, "Hide 404");
+            ui.checkbox(&mut self.use_cookies, "Use session cookies");
             ui.checkbox(&mut self.recursive, "Recursive").on_hover_text("Scan inside directories that are found");
             if self.recursive {
                 ui.label("Max depth");

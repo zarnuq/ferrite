@@ -28,30 +28,34 @@ static LINK: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
 /// Resolves a link found on `base` (an absolute URL) to an absolute URL, or `None` to skip it.
 pub fn resolve(base: &str, link: &str) -> Option<String> {
     let link = link.trim();
-    let lower = link.to_ascii_lowercase();
-    if link.is_empty() || ["mailto:", "javascript:", "tel:", "data:", "#", "ftp:"].iter().any(|p| lower.starts_with(p)) {
+    if link.is_empty() || link.starts_with('#') {
         return None;
     }
-    let (scheme, rest) = base.split_once("://")?;
-    let (authority, base_path) = rest.split_once('/').map(|(a, p)| (a, format!("/{p}"))).unwrap_or((rest, "/".into()));
-    let abs = if link.starts_with("http://") || link.starts_with("https://") {
-        link.to_string()
-    } else if let Some(pr) = link.strip_prefix("//") {
-        format!("{scheme}://{pr}")
-    } else if link.starts_with('/') {
-        format!("{scheme}://{authority}{link}")
-    } else {
-        let dir = &base_path[..base_path.rfind('/').map_or(0, |i| i + 1)];
-        format!("{scheme}://{authority}{dir}{link}")
-    };
-    // Drop the fragment; keep the query.
-    Some(abs.split('#').next().unwrap_or(&abs).to_string())
+    let mut url = url::Url::parse(base).ok()?.join(link).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    url.set_fragment(None);
+    Some(url.into())
 }
 
 /// Extracts and resolves all links from a page body.
 fn links(base: &str, body: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(body);
     LINK.captures_iter(&text).filter_map(|c| resolve(base, &c[1])).collect()
+}
+
+/// Redirects do not consume link depth; the shared visited set breaks redirect loops.
+/// Every destination still passes through the crawl's host, scope and request limits.
+fn destinations(url: &str, response: &Msg, depth: usize, max_depth: usize, follow: bool) -> Vec<(String, usize)> {
+    if matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
+        return if follow {
+            response.header("location").and_then(|l| resolve(url, l)).map(|u| vec![(u, depth)]).unwrap_or_default()
+        } else { Vec::new() };
+    }
+    let ctype = response.header("content-type").unwrap_or("").to_ascii_lowercase();
+    if depth >= max_depth || (!ctype.contains("html") && !ctype.is_empty()) { return Vec::new(); }
+    links(url, &response.decoded_body()).into_iter().map(|u| (u, depth + 1)).collect()
 }
 
 pub struct Crawler {
@@ -61,8 +65,11 @@ pub struct Crawler {
     threads: usize,
     same_host: bool,
     scope_only: bool,
+    follow_redirects: bool,
+    use_cookies: bool,
     run: u64,
     crawled: Vec<(String, u16)>,
+    errors: Vec<(String, String)>,
     cancel: Option<Arc<AtomicBool>>,
     message: String,
 }
@@ -76,8 +83,11 @@ impl Default for Crawler {
             threads: 8,
             same_host: true,
             scope_only: false,
+            follow_redirects: true,
+            use_cookies: false,
             run: 0,
             crawled: Vec::new(),
+            errors: Vec::new(),
             cancel: None,
             message: String::new(),
         }
@@ -86,6 +96,7 @@ impl Default for Crawler {
 
 pub enum Note {
     Page { url: String, status: u16 },
+    Failed { url: String, error: String },
     Done,
 }
 
@@ -100,28 +111,42 @@ impl Crawler {
         }
         match note {
             Note::Page { url, status } => self.crawled.push((url, status)),
-            Note::Done => self.cancel = None,
+            Note::Failed { url, error } => self.errors.push((url, error)),
+            Note::Done => {
+                self.cancel = None;
+                self.message.clear();
+            }
         }
     }
 
     fn start_crawl(&mut self, env: &Env) {
-        let Some(start_target) = Target::from_url(&self.start) else {
+        let Some(start) = resolve(&self.start, &self.start) else {
             self.message = "Invalid start URL".into();
             return;
         };
+        let Some(start_target) = Target::from_url(&start) else {
+            self.message = "Invalid start URL".into();
+            return;
+        };
+        let scope = rules::current(env.shared);
+        if self.scope_only && !scope.in_scope(&start) {
+            self.message = "Start URL is outside the configured scope".into();
+            return;
+        }
         self.message.clear();
         self.run += 1;
         self.crawled.clear();
+        self.errors.clear();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
 
         let (tx, ui) = (env.tx.clone(), env.egui.clone());
         let upstream = env.upstream();
-        let scope = rules::current(env.shared);
         let (run, max_pages, max_depth, threads, same_host, scope_only) =
             (self.run, self.max_pages, self.max_depth, self.threads.max(1), self.same_host, self.scope_only);
-        let start = self.start.clone();
         let start_host = start_target.host.clone();
+        let follow_redirects = self.follow_redirects;
+        let session = env.session(self.use_cookies);
 
         env.rt.spawn(async move {
             let mut visited: HashSet<String> = HashSet::new();
@@ -132,21 +157,26 @@ impl Crawler {
 
             // Breadth-first, one wave of up to `threads` pages at a time.
             while !queue.is_empty() && pages < max_pages && !cancel.load(Ordering::Relaxed) {
-                let wave: Vec<(String, usize)> = (0..threads).filter_map(|_| queue.pop_front()).collect();
-                let batch: Vec<(String, usize, Option<(Vec<u8>, Vec<u8>, u128, u16)>)> = stream::iter(wave)
+                let wave: Vec<(String, usize)> = (0..threads.min(max_pages - pages)).filter_map(|_| queue.pop_front()).collect();
+                pages += wave.len();
+                let batch: Vec<_> = stream::iter(wave)
                     .map(|(url, depth)| {
                         let upstream = upstream.clone();
+                        let tx = tx.clone();
+                        let session = session.clone();
                         async move {
-                            let Some(t) = Target::from_url(&url) else { return (url, depth, None) };
+                            let Some(t) = Target::from_url(&url) else { return (url, depth, Err("Invalid URL".to_string())) };
                             let path = http::url_path(&url);
                             let req = format!("GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", t.host_header()).into_bytes();
                             let start = Instant::now();
-                            match http::send(&t, &req, &upstream).await {
+                            let (req, result) = session.send(&t, &req, &upstream).await;
+                            let _ = tx.send(Event::Log(crate::logger::entry("Crawler", &t, &req, &result)));
+                            match result {
                                 Ok(r) => {
                                     let status = r.status;
-                                    (url, depth, Some((req, r.raw, start.elapsed().as_millis(), status)))
+                                    (url, depth, Ok((req, r.raw, start.elapsed().as_millis(), status)))
                                 }
-                                Err(_) => (url, depth, None),
+                                Err(e) => (url, depth, Err(e)),
                             }
                         }
                     })
@@ -155,8 +185,14 @@ impl Crawler {
                     .await;
 
                 for (url, depth, result) in batch {
-                    let Some((req, res, ms, status)) = result else { continue };
-                    pages += 1;
+                    let (req, res, ms, status) = match result {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Event::Crawler { run, note: Note::Failed { url, error } });
+                            ui.request_repaint();
+                            continue;
+                        }
+                    };
                     // Feed the page into history: site map + passive scan pick it up.
                     let id = CRAWL_ID.fetch_add(1, Ordering::Relaxed);
                     let _ = tx.send(Event::Request { id, url: url.clone(), raw: req });
@@ -164,14 +200,8 @@ impl Crawler {
                     let _ = tx.send(Event::Crawler { run, note: Note::Page { url: url.clone(), status } });
                     ui.request_repaint();
 
-                    if depth >= max_depth {
-                        continue;
-                    }
-                    let ctype = Msg::parse(&res).header("content-type").unwrap_or("").to_ascii_lowercase();
-                    if !ctype.contains("html") && !ctype.is_empty() {
-                        continue;
-                    }
-                    for link in links(&url, &res) {
+                    let msg = Msg::parse(&res);
+                    for (link, next_depth) in destinations(&url, &msg, depth, max_depth, follow_redirects) {
                         if visited.len() > max_pages * 20 {
                             break;
                         }
@@ -183,7 +213,7 @@ impl Crawler {
                             continue;
                         }
                         if visited.insert(link.clone()) {
-                            queue.push_back((link, depth + 1));
+                            queue.push_back((link, next_depth));
                         }
                     }
                 }
@@ -200,14 +230,16 @@ impl Crawler {
             ui.add(egui::TextEdit::singleline(&mut self.start).desired_width(360.0).hint_text("https://host/path"));
             if running {
                 if ui.button("Stop").clicked() {
-                    if let Some(c) = self.cancel.take() {
+                    if let Some(c) = &self.cancel {
                         c.store(true, Ordering::Relaxed);
+                        self.message = "Stopping…".into();
                     }
                 }
             } else if ui.button("Start crawl").clicked() {
                 self.start_crawl(env);
             }
             ui.label(format!("{} pages", self.crawled.len()));
+            if !self.errors.is_empty() { ui.label(format!("{} errors", self.errors.len())); }
             ui.colored_label(egui::Color32::LIGHT_RED, &self.message);
         });
         ui.horizontal(|ui| {
@@ -219,6 +251,8 @@ impl Crawler {
             ui.add(egui::DragValue::new(&mut self.threads).range(1..=50));
             ui.checkbox(&mut self.same_host, "Same host only");
             ui.checkbox(&mut self.scope_only, "In-scope only");
+            ui.checkbox(&mut self.follow_redirects, "Follow redirects");
+            ui.checkbox(&mut self.use_cookies, "Use session cookies");
         });
         ui.separator();
         ui.weak("Crawled pages also appear in Proxy history, the Target site map, and are passively scanned.");
@@ -233,6 +267,9 @@ impl Crawler {
                     ui.add(egui::Label::new(egui::RichText::new(status.to_string()).monospace().color(color)));
                     ui.add(egui::Label::new(egui::RichText::new(url).monospace()).truncate());
                 });
+            }
+            for (url, error) in &self.errors {
+                ui.colored_label(egui::Color32::LIGHT_RED, format!("{url}: {error}"));
             }
         });
     }
@@ -252,6 +289,156 @@ mod tests {
         assert_eq!(resolve(b, "page#frag").unwrap(), "https://a.com/dir/page");
         assert!(resolve(b, "mailto:x@y.com").is_none());
         assert!(resolve(b, "javascript:void(0)").is_none());
+    }
+
+    #[test]
+    fn normalizes_urls_and_rejects_other_protocols() {
+        let base = "https://A.com/dir/page?old=1";
+        for (link, expected) in [
+            ("../end", "https://a.com/end"),
+            ("./page#top", "https://a.com/dir/page"),
+            ("?new=2", "https://a.com/dir/page?new=2"),
+            ("HTTPS://A.COM:443/dir/../end#x", "https://a.com/end"),
+        ] {
+            assert_eq!(resolve(base, link).as_deref(), Some(expected));
+        }
+        assert_eq!(resolve("https://a.com?x=1", "?y=2").as_deref(), Some("https://a.com/?y=2"));
+        for link in ["ftp://a.com/file", "ws://a.com/", "data:text/html,hi", "tel:123", "#top"] {
+            assert!(resolve(base, link).is_none(), "{link}");
+        }
+    }
+
+    /// Exercise the real sender and UI event channel, including compressed HTML,
+    /// relative links, deduplication, host/scope boundaries and exact request budgets.
+    #[tokio::test]
+    async fn crawls_local_site_with_limits() {
+        use std::sync::{Mutex, RwLock, mpsc};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let seen = requested.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 { return; }
+                        raw.extend_from_slice(&buf[..n]);
+                    }
+                    let request = String::from_utf8_lossy(&raw);
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    seen.lock().unwrap().push(path.to_string());
+                    if path == "/drop" { return; }
+                    let (status, extra) = match path {
+                        "/redirect" => ("302 Found", "Location: /end\r\n".to_string()),
+                        "/loop-a" => ("301 Moved", "Location: /loop-b\r\n".to_string()),
+                        "/loop-b" => ("308 Redirect", "Location: /loop-a\r\n".to_string()),
+                        "/external" => ("302 Found", format!("Location: http://localhost:{port}/foreign\r\n")),
+                        "/scoped" => ("307 Redirect", "Location: /blocked\r\n".to_string()),
+                        _ => ("200 OK", String::new()),
+                    };
+                    let body = match path {
+                        "/" => format!(r#"<a href="/dir/page">page</a><a href="/a">a</a><a href="/b">b</a><a href="/c">c</a><a href="/blocked">scope</a><a href="http://localhost:{port}/foreign">other host</a>"#),
+                        "/dir/page" => r#"<a href="../end">end</a><a href="/dir/./page#top">duplicate</a>"#.into(),
+                        _ => String::new(),
+                    };
+                    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    std::io::Write::write_all(&mut encoder, body.as_bytes()).unwrap();
+                    let body = encoder.finish().unwrap();
+                    let head = format!("HTTP/1.1 {status}\r\n{extra}Content-Type: text/html\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                });
+            }
+        });
+
+        for (start_path, max_pages, max_depth, scope_only, follow_redirects, expected) in [
+            ("/", 1, 3, false, true, 1),
+            ("/", 2, 3, false, true, 2),
+            ("/", 100, 0, false, true, 1),
+            ("/", 100, 1, false, true, 6),
+            ("/", 100, 3, false, true, 7),
+            ("/", 100, 3, true, true, 6),
+            ("/redirect", 100, 0, false, true, 2),
+            ("/redirect", 100, 0, false, false, 1),
+            ("/redirect", 1, 0, false, true, 1),
+            ("/loop-a", 100, 0, false, true, 2),
+            ("/external", 100, 0, false, true, 1),
+            ("/scoped", 100, 0, true, true, 1),
+            ("/drop", 1, 0, false, true, 0),
+        ] {
+            requested.lock().unwrap().clear();
+            let cfg = rules::Config { exclude: vec!["/blocked$".into()], ..Default::default() };
+            let shared = Arc::new(RwLock::new(Arc::new(rules::Compiled::new(cfg))));
+            let (tx, rx) = mpsc::channel();
+            let mut actions = Vec::new();
+            let mut crawler = Crawler {
+                start: format!("http://127.0.0.1:{port}{start_path}#fragment"),
+                max_pages, max_depth, scope_only, follow_redirects, ..Default::default()
+            };
+            crawler.start_crawl(&Env {
+                rt: &tokio::runtime::Handle::current(), tx: &tx,
+                egui: &egui::Context::default(), shared: &shared, jar: &Arc::default(), actions: &mut actions,
+            });
+            let mut requests = HashSet::new();
+            let mut responses = HashSet::new();
+            let mut log_count = 0;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    while let Ok(event) = rx.try_recv() {
+                        match event {
+                            Event::Request { id, url, .. } => { requests.insert(id); assert!(!url.contains('#')); }
+                            Event::Response { id, .. } => { responses.insert(id); }
+                            Event::Crawler { run, note } => crawler.on_note(run, note),
+                            Event::Log(_) => log_count += 1,
+                            _ => {},
+                        }
+                    }
+                    if crawler.cancel.is_none() { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }).await.expect("crawl timed out");
+            assert_eq!(crawler.crawled.len(), expected, "pages={max_pages}, depth={max_depth}, scope={scope_only}");
+            assert_eq!(requests, responses, "every history request needs its response");
+            assert_eq!(requests.len(), expected);
+            let paths = requested.lock().unwrap();
+            assert_eq!(paths.len(), expected.max(1), "request budget must hold on the wire");
+            assert_eq!(log_count, paths.len(), "all attempts appear in Logger");
+            assert_eq!(crawler.errors.len(), usize::from(start_path == "/drop"));
+            assert!(!paths.iter().any(|p| p == "/foreign"));
+            if start_path == "/" && max_pages == 100 && max_depth > 1 { assert!(paths.iter().any(|p| p == "/end")); }
+            if scope_only { assert!(!paths.iter().any(|p| p == "/blocked")); }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_or_out_of_scope_start() {
+        use std::sync::{RwLock, mpsc};
+        let cfg = rules::Config { exclude: vec![".*".into()], ..Default::default() };
+        let shared = Arc::new(RwLock::new(Arc::new(rules::Compiled::new(cfg))));
+        let (tx, rx) = mpsc::channel();
+        let mut actions = Vec::new();
+        let env = Env {
+            rt: &tokio::runtime::Handle::current(), tx: &tx,
+            egui: &egui::Context::default(), shared: &shared, jar: &Arc::default(), actions: &mut actions,
+        };
+        for (start, scope_only, message) in [
+            ("ftp://example.com/", false, "Invalid start URL"),
+            ("http://example.com/", true, "Start URL is outside the configured scope"),
+        ] {
+            let mut crawler = Crawler { start: start.into(), scope_only, ..Default::default() };
+            crawler.start_crawl(&env);
+            assert_eq!(crawler.message, message);
+            assert!(crawler.cancel.is_none());
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[test]

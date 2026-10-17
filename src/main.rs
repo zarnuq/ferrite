@@ -5,15 +5,19 @@ mod discovery;
 mod history;
 mod http;
 mod intercept;
+mod inspector;
 mod intruder;
 mod logger;
 mod project;
+mod organizer;
 mod proxy;
 mod repeater;
 mod rules;
 mod scanner;
+mod search;
 mod sequencer;
 mod settings;
+mod session;
 mod target;
 mod ws_repeater;
 
@@ -53,6 +57,7 @@ pub enum Event {
     WsRepeater { run: u64, note: ws_repeater::Note },
     Crawler { run: u64, note: crawler::Note },
     Log(logger::Entry),
+    Search { run: u64, results: search::Results },
     Sequencer { run: u64, result: Result<http::Reply, String> },
     Status(String),
     Issue(String, scanner::Issue),
@@ -70,6 +75,7 @@ pub enum Action {
     Decoder(String),
     AddScope(String),
     Scan(Target, Vec<u8>),
+    Organize(String, Vec<u8>, Option<Vec<u8>>),
 }
 
 /// What tabs need from the app: the runtime for network work, the event channel and settings.
@@ -78,6 +84,7 @@ pub struct Env<'a> {
     pub tx: &'a mpsc::Sender<Event>,
     pub egui: &'a egui::Context,
     pub shared: &'a Shared,
+    pub jar: &'a session::Shared,
     pub actions: &'a mut Vec<Action>,
 }
 
@@ -89,6 +96,10 @@ impl Env<'_> {
             let _ = tx.send(fut.await);
             ui.request_repaint();
         });
+    }
+
+    pub fn session(&self, reuse: bool) -> session::Client {
+        session::Client::new(self.jar.clone(), reuse, rules::current(self.shared).cfg.capture_cookies)
     }
 
     pub fn upstream(&self) -> http::Upstream {
@@ -108,9 +119,12 @@ enum Tab {
     Discovery,
     Crawler,
     Logger,
+    Search,
     Decoder,
     Comparer,
     Settings,
+    Sessions,
+    Organizer,
 }
 
 struct App {
@@ -133,6 +147,9 @@ struct App {
     discovery: discovery::Discovery,
     crawler: crawler::Crawler,
     logger: logger::Logger,
+    search: search::Search,
+    sessions: session::Sessions,
+    organizer: organizer::Organizer,
     decoder: decoder::Decoder,
     comparer: comparer::Comparer,
 }
@@ -207,6 +224,9 @@ fn main() -> eframe::Result {
                 discovery: Default::default(),
                 crawler: Default::default(),
                 logger: Default::default(),
+                search: Default::default(),
+                sessions: Default::default(),
+                organizer: Default::default(),
                 decoder: Default::default(),
                 comparer: Default::default(),
             }))
@@ -219,7 +239,12 @@ impl App {
         for ev in self.rx.try_iter() {
             match ev {
                 Event::Request { id, url, raw } => self.history.on_request(id, url, raw),
-                Event::Response { id, raw, ms } => self.history.on_response(id, raw, ms),
+                Event::Response { id, raw, ms } => {
+                    if self.cfg.capture_cookies {
+                        if let Some(flow) = self.history.flow(id) { self.sessions.jar.lock().unwrap().capture(&flow.url, &raw); }
+                    }
+                    self.history.on_response(id, raw, ms);
+                },
                 Event::Ws { url, outgoing, text, data } => self.history.on_ws(url, outgoing, text, data),
                 Event::Intercept(p) => self.intercept.push(p, &self.cfg),
                 Event::Repeater { tab, result } => self.repeater.on_result(tab, result),
@@ -228,7 +253,13 @@ impl App {
                 Event::Discovery { run, idx, result } => self.discovery.on_result(run, idx, result),
                 Event::WsRepeater { run, note } => self.ws_repeater.on_note(run, note),
                 Event::Crawler { run, note } => self.crawler.on_note(run, note),
-                Event::Log(e) => self.logger.push(e),
+                Event::Log(e) => {
+                    if self.cfg.capture_cookies && !matches!(e.tool, "Repeater" | "Crawler" | "Discovery") {
+                        if let Some(response) = &e.response { self.sessions.jar.lock().unwrap().capture(&e.url, response); }
+                    }
+                    self.logger.push(e);
+                },
+                Event::Search { run, results } => self.search.on_result(run, results),
                 Event::Status(s) => self.status = s,
                 Event::Issue(key, issue) => self.history.add_issue(key, issue),
             }
@@ -238,6 +269,10 @@ impl App {
     fn apply(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
+                Action::Organize(url, request, response) => {
+                    self.organizer.add(url, request, response);
+                    self.tab = Tab::Organizer;
+                }
                 Action::Repeater(t, raw) => {
                     self.repeater.add(t, raw);
                     self.tab = Tab::Repeater;
@@ -312,7 +347,7 @@ impl eframe::App for App {
         let egui_ctx = ui.ctx().clone();
 
         egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let pending = self.intercept.queue.len();
                 let intercept = if pending > 0 { format!("Intercept ({pending})") } else { "Intercept".into() };
                 let issues = self.history.issues.len();
@@ -327,8 +362,11 @@ impl eframe::App for App {
                     (Tab::Discovery, "Discovery".into()),
                     (Tab::Crawler, "Crawler".into()),
                     (Tab::Logger, "Logger".into()),
+                    (Tab::Search, "Search".into()),
                     (Tab::Decoder, "Decoder".into()),
                     (Tab::Comparer, "Comparer".into()),
+                    (Tab::Organizer, "Organizer".into()),
+                    (Tab::Sessions, "Sessions".into()),
                     (Tab::Settings, "Settings".into()),
                 ] {
                     ui.selectable_value(&mut self.tab, tab, label);
@@ -343,23 +381,30 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.menu_button("Project", |ui| {
-                    ui.label("Save/load history, WebSockets and issues as a .ferrite file.");
+                    ui.label("Save/load history, WebSockets, issues Repeater tabs and Organizer as a .ferrite file.");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.project_path).hint_text("/path/to/session.ferrite").desired_width(320.0));
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() && !self.project_path.is_empty() {
                             let path = if self.project_path.ends_with(".ferrite") { self.project_path.clone() } else { format!("{}.ferrite", self.project_path) };
-                            self.status = match project::save(&self.history, &path) {
+                            self.status = match project::save(&self.history, &self.repeater, &self.organizer, &path) {
                                 Ok(()) => format!("Saved {} flows to {path}", self.history.flows.len()),
                                 Err(e) => format!("Save failed: {e}"),
                             };
                             ui.close();
                         }
                         if ui.button("Load").clicked() && !self.project_path.is_empty() {
-                            self.status = match project::load(&mut self.history, &self.project_path) {
+                            self.status = match project::load(&mut self.history, &mut self.repeater, &mut self.organizer, &self.project_path) {
                                 Ok(n) => format!("Loaded {n} flows from {}", self.project_path),
                                 Err(e) => format!("Load failed: {e}"),
+                            };
+                            ui.close();
+                        }
+                        if ui.button("Import HAR").on_hover_text("Append reconstructed traffic from a .har or .har.gz file").clicked() && !self.project_path.is_empty() {
+                            self.status = match project::import_har(&mut self.history, &self.project_path) {
+                                Ok(n) => format!("Imported {n} HAR entries"),
+                                Err(e) => format!("HAR import failed: {e}"),
                             };
                             ui.close();
                         }
@@ -404,6 +449,7 @@ impl eframe::App for App {
                 tx: &self.tx,
                 egui: &egui_ctx,
                 shared: &self.shared,
+                jar: &self.sessions.jar,
                 actions: &mut actions,
             };
             match self.tab {
@@ -417,9 +463,12 @@ impl eframe::App for App {
                 Tab::Discovery => self.discovery.ui(ui, &mut env),
                 Tab::Crawler => self.crawler.ui(ui, &mut env),
                 Tab::Logger => self.logger.ui(ui, &mut env),
+                Tab::Search => self.search.ui(ui, &self.history, &self.logger, &mut env),
                 Tab::Decoder => self.decoder.ui(ui),
                 Tab::Comparer => self.comparer.ui(ui),
                 Tab::Settings => settings::ui(ui, &mut self.cfg),
+                Tab::Sessions => self.sessions.ui(ui, &mut self.cfg.capture_cookies),
+                Tab::Organizer => self.organizer.ui(ui, &mut env),
             }
         });
 
@@ -430,9 +479,9 @@ impl eframe::App for App {
 
     /// Autosave the session so an accidental close doesn't lose captured traffic.
     fn on_exit(&mut self) {
-        if !self.history.flows.is_empty() {
+        if !self.history.flows.is_empty() || !self.repeater.is_empty() || !self.organizer.is_empty() {
             let path = proxy::config_dir().join("autosave.ferrite");
-            let _ = project::save(&self.history, &path.to_string_lossy());
+            let _ = project::save(&self.history, &self.repeater, &self.organizer, &path.to_string_lossy());
         }
     }
 }
@@ -557,6 +606,10 @@ pub fn editor(ui: &mut egui::Ui, id: &str, text: &mut String) -> egui::text_edit
 
 /// Context-menu entries shared by every place that shows a request.
 pub fn send_menu(ui: &mut egui::Ui, env: &mut Env, url: &str, req: &[u8], res: Option<&[u8]>) {
+    if ui.button("Add to Organizer").clicked() {
+        env.actions.push(Action::Organize(url.to_string(), req.to_vec(), res.map(<[u8]>::to_vec)));
+        ui.close();
+    }
     let target = Target::from_url(url);
     if let Some(t) = &target {
         if ui.button("Send to Repeater").clicked() {

@@ -84,6 +84,7 @@ pub struct Config {
     pub theme: Theme,
     /// Record only in-scope traffic in history (still proxies everything).
     pub record_scope_only: bool,
+    pub capture_cookies: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -117,6 +118,7 @@ impl Default for Config {
             mods: Mods::default(),
             theme: Theme::System,
             record_scope_only: false,
+            capture_cookies: true,
         }
     }
 }

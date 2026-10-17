@@ -1376,6 +1376,7 @@ dependencies = [
  "egui_extras",
  "flate2",
  "http-body-util",
+ "httpdate",
  "hudsucker",
  "hyper-rustls",
  "hyper-util",
@@ -1387,10 +1388,12 @@ dependencies = [
  "sha1",
  "sha2",
  "similar",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-socks",
  "tower-service",
+ "url",
  "zstd",
 ]
 

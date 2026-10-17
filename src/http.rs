@@ -141,40 +141,35 @@ pub fn to_wire(text: &str, update_length: bool) -> Vec<u8> {
     out
 }
 
-/// Builds the request that follows a redirect: same headers, new target and path.
-/// 307/308 keep the method and body; other codes switch to GET.
-pub fn follow_redirect(target: &Target, request: &str, location: &str, status: u16) -> (Target, String) {
+/// Builds a redirect request using browser-style method rewriting. Credentials stay
+/// within the same origin, and unsupported schemes are rejected before a send.
+pub fn follow_redirect(target: &Target, request: &str, location: &str, status: u16) -> Result<(Target, String), String> {
     let m = Msg::parse(request.as_bytes());
-    let (new_target, path) = if location.starts_with("http://") || location.starts_with("https://") {
-        let t = Target::from_url(location).unwrap_or_else(|| target.clone());
-        let rest = location.splitn(4, '/').nth(3).unwrap_or("");
-        (t, format!("/{rest}"))
-    } else if location.starts_with("//") {
-        let url = format!("{}:{location}", if target.tls { "https" } else { "http" });
-        let t = Target::from_url(&url).unwrap_or_else(|| target.clone());
-        (t, format!("/{}", location.splitn(4, '/').nth(3).unwrap_or("")))
-    } else if location.starts_with('/') {
-        (target.clone(), location.to_string())
-    } else {
-        let cur = m.first.split_whitespace().nth(1).unwrap_or("/");
-        let dir = &cur[..cur.split('?').next().unwrap_or("/").rfind('/').map_or(0, |i| i + 1)];
-        (target.clone(), format!("{dir}{location}"))
-    };
-    let keep = status == 307 || status == 308;
-    let method = if keep { m.first.split_whitespace().next().unwrap_or("GET") } else { "GET" };
+    let old_method = m.first.split_whitespace().next().unwrap_or("GET");
+    let current = m.first.split_whitespace().nth(1).unwrap_or("/");
+    let base = url::Url::parse(&target.url()).and_then(|base| base.join(current)).map_err(|e| e.to_string())?;
+    let mut url = base.join(location).map_err(|e| format!("Invalid redirect URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
+        return Err("Redirect must be an HTTP(S) URL without embedded credentials".into());
+    }
+    url.set_fragment(None);
+    let new_target = Target::from_url(url.as_str()).ok_or("Invalid redirect target")?;
+    let same_origin = base.origin() == url.origin();
+    let path = &url[url::Position::BeforePath..];
+    let get = (status == 303 && old_method != "HEAD") || (matches!(status, 301 | 302) && old_method == "POST");
+    let method = if get { "GET" } else { old_method };
     let mut out = Msg { first: format!("{method} {path} HTTP/1.1"), headers: Vec::new(), body: Vec::new() };
     out.headers.push(("Host".into(), new_target.host_header()));
     for (k, v) in &m.headers {
         let lk = k.to_ascii_lowercase();
-        let body_header = matches!(lk.as_str(), "content-length" | "content-type" | "transfer-encoding");
-        if lk != "host" && (keep || !body_header) {
+        let body_header = matches!(lk.as_str(), "content-length" | "content-type" | "transfer-encoding" | "content-encoding");
+        let credential = matches!(lk.as_str(), "authorization" | "proxy-authorization" | "cookie" | "cookie2");
+        if lk != "host" && (!get || !body_header) && (same_origin || !credential) {
             out.headers.push((k.clone(), v.clone()));
         }
     }
-    if keep {
-        out.body = m.body;
-    }
-    (new_target, String::from_utf8_lossy(&out.render()).into_owned())
+    if !get { out.body = m.body; }
+    Ok((new_target, String::from_utf8_lossy(&out.render()).into_owned()))
 }
 
 /// A Python `requests` snippet that reproduces a captured request.
@@ -463,7 +458,7 @@ pub fn hexdump(data: &[u8]) -> String {
 
 // ---------- client ----------
 
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Target {
     pub host: String,
     pub port: u16,
@@ -483,10 +478,11 @@ impl Target {
 
     /// Value for a Host header: port omitted when it is the scheme default.
     pub fn host_header(&self) -> String {
+        let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
         if self.port == if self.tls { 443 } else { 80 } {
-            self.host.clone()
+            host
         } else {
-            format!("{}:{}", self.host, self.port)
+            format!("{host}:{}", self.port)
         }
     }
 
@@ -497,13 +493,10 @@ impl Target {
 
 /// Path-and-query of an absolute URL (defaults to "/").
 pub fn url_path(url: &str) -> String {
-    match url.split_once("://") {
-        Some((_, rest)) => match rest.find('/') {
-            Some(i) => rest[i..].to_string(),
-            None => "/".to_string(),
-        },
-        None => if url.starts_with('/') { url.to_string() } else { "/".to_string() },
+    if let Ok(url) = url::Url::parse(url) {
+        return url[url::Position::BeforePath..url::Position::AfterQuery].to_string();
     }
+    if url.starts_with('/') { url.split('#').next().unwrap_or("/").to_string() } else { "/".to_string() }
 }
 
 #[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -730,11 +723,43 @@ mod tests {
     fn redirects() {
         let t = Target { host: "a.com".into(), port: 443, tls: true };
         let req = "POST /x/y HTTP/1.1\r\nHost: a.com\r\nCookie: s=1\r\nContent-Length: 1\r\n\r\nz";
-        let (t2, r) = follow_redirect(&t, req, "http://b.com:81/p?q", 302);
+        let (t2, r) = follow_redirect(&t, req, "http://b.com:81/p?q", 302).unwrap();
         assert_eq!((t2.host.as_str(), t2.port, t2.tls), ("b.com", 81, false));
-        assert_eq!(r, "GET /p?q HTTP/1.1\r\nHost: b.com:81\r\nCookie: s=1\r\n\r\n");
-        assert!(follow_redirect(&t, req, "z", 307).1.starts_with("POST /x/z HTTP/1.1"));
-        assert!(follow_redirect(&t, req, "/top", 301).1.starts_with("GET /top "));
+        assert_eq!(r, "GET /p?q HTTP/1.1\r\nHost: b.com:81\r\n\r\n");
+        assert!(follow_redirect(&t, req, "z", 307).unwrap().1.starts_with("POST /x/z HTTP/1.1"));
+        assert!(follow_redirect(&t, req, "/top", 301).unwrap().1.starts_with("GET /top "));
+    }
+
+    #[test]
+    fn redirects_resolve_urls_and_keep_credentials_within_origin() {
+        let t = Target::from_url("https://a.com/").unwrap();
+        let req = "POST /dir/page?old=1 HTTP/1.1\r\nHost: a.com\r\nAuthorization: Bearer secret\r\nCookie: sid=secret\r\nContent-Type: text/plain\r\nContent-Length: 4\r\n\r\ndata";
+        let (_, same) = follow_redirect(&t, req, "../done?x=2#top", 307).unwrap();
+        let same = Msg::parse(same.as_bytes());
+        assert_eq!(same.first, "POST /done?x=2 HTTP/1.1");
+        assert_eq!(same.header("authorization"), Some("Bearer secret"));
+        assert_eq!(same.body, b"data");
+        let (other, request) = follow_redirect(&t, req, "//b.com:8443?x=1", 302).unwrap();
+        let request = Msg::parse(request.as_bytes());
+        assert_eq!(other.port, 8443);
+        assert_eq!(request.first, "GET /?x=1 HTTP/1.1");
+        assert!(request.header("cookie").is_none());
+        assert!(request.header("authorization").is_none());
+        assert!(request.header("content-length").is_none());
+        assert!(request.body.is_empty());
+        let (_, downgrade) = follow_redirect(&t, req, "http://a.com/", 308).unwrap();
+        assert!(Msg::parse(downgrade.as_bytes()).header("authorization").is_none());
+        let put = req.replacen("POST", "PUT", 1);
+        assert!(follow_redirect(&t, &put, "?new=2", 302).unwrap().1.starts_with("PUT /dir/page?new=2 "));
+        let head = req.replacen("POST", "HEAD", 1);
+        assert!(follow_redirect(&t, &head, "/done", 303).unwrap().1.starts_with("HEAD /done "));
+        for location in ["javascript:alert(1)", "ftp://a.com/", "https://user:pass@b.com/"] {
+            assert!(follow_redirect(&t, req, location, 302).is_err());
+        }
+        assert_eq!(url_path("https://a.com?x=1#top"), "/?x=1");
+        let ipv6 = Target::from_url("http://[::1]:8080/").unwrap();
+        assert_eq!(ipv6.host_header(), "[::1]:8080");
+        assert_eq!(ipv6.url(), "http://[::1]:8080");
     }
 
     #[test]
