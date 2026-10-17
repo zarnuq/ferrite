@@ -52,13 +52,18 @@ struct SavedTab {
     pos: usize,
 }
 
-#[derive(Default)]
 pub struct Repeater {
     tabs: Vec<Tab>,
     renaming: Option<usize>,
     current: usize,
     next_id: u64,
     view: Viewer,
+}
+
+impl Default for Repeater {
+    fn default() -> Self {
+        Self { tabs: Vec::new(), renaming: None, current: 0, next_id: 0, view: Viewer::new(http::View::Pretty) }
+    }
 }
 
 /// History may hold HTTP/2 requests; the raw client speaks HTTP/1.1.

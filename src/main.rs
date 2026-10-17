@@ -380,8 +380,10 @@ impl eframe::App for App {
                     self.cfg.intercept.on = !on;
                 }
                 ui.separator();
-                ui.menu_button("Project", |ui| {
-                    ui.label("Save/load history, WebSockets, issues Repeater tabs and Organizer as a .ferrite file.");
+                egui::containers::menu::MenuButton::new("Project")
+                    .config(egui::containers::menu::MenuConfig::default().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                    .ui(ui, |ui| {
+                    ui.label("Save/load history, WebSockets, issues, Repeater tabs and Organizer as a .ferrite file.");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.project_path).hint_text("/path/to/session.ferrite").desired_width(320.0));
                     });
