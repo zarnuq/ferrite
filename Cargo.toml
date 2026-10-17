@@ -1,0 +1,29 @@
+[package]
+name = "ferrite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+brotli = "9.0.0"
+bytes = "1.12.1"
+eframe = "0.37.0"
+egui_extras = "0.37.0"
+flate2 = "1.1.10"
+http-body-util = "0.1.5"
+hudsucker = { version = "0.25.0", features = ["http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "aws-lc-rs"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
+md-5 = "0.11"
+percent-encoding = "2.3.2"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha1 = "0.11"
+sha2 = "0.11"
+similar = "3.2.0"
+tokio = { version = "1.53.3", features = ["full"] }
+tokio-rustls = "0.26.6"
+tokio-socks = "0.5.3"
+tower-service = "0.3.3"
+zstd = "0.14.3"
