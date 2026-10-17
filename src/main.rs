@@ -52,7 +52,9 @@ pub enum Event {
     Ws { url: String, outgoing: bool, text: bool, data: Vec<u8> },
     Intercept(Pending),
     Repeater { tab: u64, result: Result<http::Reply, String> },
-    Intruder { attack: u64, idx: usize, result: Result<http::Reply, String> },
+    Intruder { attack: u64, idx: usize, request: Vec<u8>, result: Result<http::Reply, String> },
+    IntruderQueued { attack: u64, idx: usize, payloads: String, request: Vec<u8> },
+    IntruderDone { attack: u64 },
     Discovery { run: u64, idx: usize, result: Result<http::Reply, String> },
     WsRepeater { run: u64, note: ws_repeater::Note },
     Crawler { run: u64, note: crawler::Note },
@@ -248,7 +250,9 @@ impl App {
                 Event::Ws { url, outgoing, text, data } => self.history.on_ws(url, outgoing, text, data),
                 Event::Intercept(p) => self.intercept.push(p, &self.cfg),
                 Event::Repeater { tab, result } => self.repeater.on_result(tab, result),
-                Event::Intruder { attack, idx, result } => self.intruder.on_result(attack, idx, result),
+                Event::Intruder { attack, idx, request, result } => self.intruder.on_result(attack, idx, request, result),
+                Event::IntruderQueued { attack, idx, payloads, request } => self.intruder.on_queued(attack, idx, payloads, request),
+                Event::IntruderDone { attack } => self.intruder.on_done(attack),
                 Event::Sequencer { run, result } => self.sequencer.on_result(run, result),
                 Event::Discovery { run, idx, result } => self.discovery.on_result(run, idx, result),
                 Event::WsRepeater { run, note } => self.ws_repeater.on_note(run, note),
@@ -383,21 +387,21 @@ impl eframe::App for App {
                 egui::containers::menu::MenuButton::new("Project")
                     .config(egui::containers::menu::MenuConfig::default().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
                     .ui(ui, |ui| {
-                    ui.label("Save/load history, WebSockets, issues, Repeater tabs and Organizer as a .ferrite file.");
+                    ui.label("Save/load history, WebSockets, issues, Repeater, Intruder and Organizer as a .ferrite file.");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.project_path).hint_text("/path/to/session.ferrite").desired_width(320.0));
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() && !self.project_path.is_empty() {
                             let path = if self.project_path.ends_with(".ferrite") { self.project_path.clone() } else { format!("{}.ferrite", self.project_path) };
-                            self.status = match project::save(&self.history, &self.repeater, &self.organizer, &path) {
+                            self.status = match project::save(&self.history, &self.repeater, &self.organizer, &self.intruder, &path) {
                                 Ok(()) => format!("Saved {} flows to {path}", self.history.flows.len()),
                                 Err(e) => format!("Save failed: {e}"),
                             };
                             ui.close();
                         }
                         if ui.button("Load").clicked() && !self.project_path.is_empty() {
-                            self.status = match project::load(&mut self.history, &mut self.repeater, &mut self.organizer, &self.project_path) {
+                            self.status = match project::load(&mut self.history, &mut self.repeater, &mut self.organizer, &mut self.intruder, &self.project_path) {
                                 Ok(n) => format!("Loaded {n} flows from {}", self.project_path),
                                 Err(e) => format!("Load failed: {e}"),
                             };
@@ -481,9 +485,9 @@ impl eframe::App for App {
 
     /// Autosave the session so an accidental close doesn't lose captured traffic.
     fn on_exit(&mut self) {
-        if !self.history.flows.is_empty() || !self.repeater.is_empty() || !self.organizer.is_empty() {
+        if !self.history.flows.is_empty() || !self.repeater.is_empty() || !self.organizer.is_empty() || !self.intruder.is_empty() {
             let path = proxy::config_dir().join("autosave.ferrite");
-            let _ = project::save(&self.history, &self.repeater, &self.organizer, &path.to_string_lossy());
+            let _ = project::save(&self.history, &self.repeater, &self.organizer, &self.intruder, &path.to_string_lossy());
         }
     }
 }

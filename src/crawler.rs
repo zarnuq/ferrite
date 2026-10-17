@@ -8,22 +8,15 @@ use crate::{
 };
 use eframe::egui;
 use hudsucker::futures::{StreamExt, stream};
-use regex::Regex;
+use scraper::{Html, Selector};
 use std::{
     collections::{HashSet, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Instant,
 };
-
-/// History ids for crawled pages, kept well above the proxy's per-session counter to avoid clashes.
-static CRAWL_ID: AtomicU64 = AtomicU64::new(1 << 50);
-
-static LINK: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:href|src|action)\s*=\s*["']([^"'#>\s]+)"#).unwrap()
-});
 
 /// Resolves a link found on `base` (an absolute URL) to an absolute URL, or `None` to skip it.
 pub fn resolve(base: &str, link: &str) -> Option<String> {
@@ -32,7 +25,8 @@ pub fn resolve(base: &str, link: &str) -> Option<String> {
         return None;
     }
     let mut url = url::Url::parse(base).ok()?.join(link).ok()?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
+        || !url.username().is_empty() || url.password().is_some() {
         return None;
     }
     url.set_fragment(None);
@@ -42,7 +36,43 @@ pub fn resolve(base: &str, link: &str) -> Option<String> {
 /// Extracts and resolves all links from a page body.
 fn links(base: &str, body: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(body);
-    LINK.captures_iter(&text).filter_map(|c| resolve(base, &c[1])).collect()
+    let document = Html::parse_document(&text);
+    let base_selector = Selector::parse("base[href]").unwrap();
+    let effective_base = document.select(&base_selector).next()
+        .and_then(|el| el.value().attr("href"))
+        .and_then(|href| resolve(base, href)).unwrap_or_else(|| base.to_string());
+    let selector = Selector::parse("a[href], area[href], link[href], iframe[src], frame[src], img[src], script[src], source[src], audio[src], video[src], embed[src], input[src], form[action], button[formaction], input[formaction], object[data]").unwrap();
+    document.select(&selector).flat_map(|el| {
+        ["href", "src", "action", "formaction", "data"].into_iter()
+            .filter_map(move |attr| el.value().attr(attr))
+    }).filter_map(|link| resolve(&effective_base, link)).collect()
+}
+
+/// Custom headers are sent only to the starting origin, including its scheme and port.
+fn custom_headers(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut headers = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let (name, value) = line.split_once(':').ok_or("Headers must use Name: value")?;
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+            || value.bytes().any(|b| b < 32 && b != b'\t' || b == 127) {
+            return Err("Invalid header name or value".into());
+        }
+        if ["host", "connection", "content-length", "transfer-encoding", "trailer", "upgrade", "proxy-authorization", "proxy-connection", "expect"].contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(format!("Crawler controls the {name} header"));
+        }
+        headers.push((name.to_string(), value.trim().to_string()));
+    }
+    Ok(headers)
+}
+
+fn request(url: &str, origin: &url::Origin, headers: &[(String, String)]) -> Vec<u8> {
+    let target = Target::from_url(url).unwrap();
+    let mut raw = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", http::url_path(url), target.host_header());
+    if url::Url::parse(url).unwrap().origin() == *origin {
+        for (name, value) in headers { raw += &format!("{name}: {value}\r\n"); }
+    }
+    raw += "\r\n";
+    raw.into_bytes()
 }
 
 /// Redirects do not consume link depth; the shared visited set breaks redirect loops.
@@ -67,6 +97,7 @@ pub struct Crawler {
     scope_only: bool,
     follow_redirects: bool,
     use_cookies: bool,
+    headers: String,
     run: u64,
     crawled: Vec<(String, u16)>,
     errors: Vec<(String, String)>,
@@ -85,6 +116,7 @@ impl Default for Crawler {
             scope_only: false,
             follow_redirects: true,
             use_cookies: false,
+            headers: String::new(),
             run: 0,
             crawled: Vec::new(),
             errors: Vec::new(),
@@ -129,6 +161,11 @@ impl Crawler {
             return;
         };
         let scope = rules::current(env.shared);
+        let headers = match custom_headers(&self.headers) {
+            Ok(headers) => headers,
+            Err(error) => { self.message = error; return; }
+        };
+        let origin = url::Url::parse(&start).unwrap().origin();
         if self.scope_only && !scope.in_scope(&start) {
             self.message = "Start URL is outside the configured scope".into();
             return;
@@ -164,10 +201,11 @@ impl Crawler {
                         let upstream = upstream.clone();
                         let tx = tx.clone();
                         let session = session.clone();
+                        let headers = &headers;
+                        let origin = &origin;
                         async move {
                             let Some(t) = Target::from_url(&url) else { return (url, depth, Err("Invalid URL".to_string())) };
-                            let path = http::url_path(&url);
-                            let req = format!("GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", t.host_header()).into_bytes();
+                            let req = request(&url, origin, headers);
                             let start = Instant::now();
                             let (req, result) = session.send(&t, &req, &upstream).await;
                             let _ = tx.send(Event::Log(crate::logger::entry("Crawler", &t, &req, &result)));
@@ -194,7 +232,7 @@ impl Crawler {
                         }
                     };
                     // Feed the page into history: site map + passive scan pick it up.
-                    let id = CRAWL_ID.fetch_add(1, Ordering::Relaxed);
+                    let id = crate::history::next_id();
                     let _ = tx.send(Event::Request { id, url: url.clone(), raw: req });
                     let _ = tx.send(Event::Response { id, raw: res.clone(), ms });
                     let _ = tx.send(Event::Crawler { run, note: Note::Page { url: url.clone(), status } });
@@ -253,6 +291,11 @@ impl Crawler {
             ui.checkbox(&mut self.scope_only, "In-scope only");
             ui.checkbox(&mut self.follow_redirects, "Follow redirects");
             ui.checkbox(&mut self.use_cookies, "Use session cookies");
+        });
+        ui.collapsing("Custom request headers", |ui| {
+            ui.weak("Sent only to the start URL's origin. Add Authorization, Cookie or application headers, one per line.");
+            ui.add_enabled(!running, egui::TextEdit::multiline(&mut self.headers)
+                .desired_rows(3).desired_width(f32::INFINITY).hint_text("Authorization: Bearer …"));
         });
         ui.separator();
         ui.weak("Crawled pages also appear in Proxy history, the Target site map, and are passively scanned.");
@@ -449,5 +492,38 @@ mod tests {
         assert!(found.contains(&"https://h.com/b.png".to_string()));
         assert!(found.contains(&"https://z.com/f".to_string()));
         assert!(!found.iter().any(|l| l.contains("top")));
+    }
+
+    #[test]
+    fn parses_real_html_and_base_urls() {
+        let found = links("https://h.com/page", br#"
+            <!-- <a href='/comment'> -->
+            <script>const x = '<a href="/script-string">';</script>
+            <base href=/assets/><base href=https://ignored.com/>
+            <A HREF='file?a=1&amp;b=2#part'>a</A>
+            <img src=photo.png><form action=../submit>
+            <input formaction='/other'><object data='doc.pdf'>
+            <div data-href='/not-a-link'></div>
+        "#);
+        assert_eq!(found, ["https://h.com/assets/file?a=1&b=2", "https://h.com/assets/photo.png",
+            "https://h.com/submit", "https://h.com/other", "https://h.com/assets/doc.pdf"]);
+        assert!(resolve("https://h.com/", "https://user:pass@h.com/").is_none());
+    }
+
+    #[test]
+    fn custom_headers_are_validated_and_origin_bound() {
+        let headers = custom_headers("Authorization: Bearer token\nCookie: sid=123\nX-Test: yes").unwrap();
+        let origin = url::Url::parse("https://h.com/start").unwrap().origin();
+        let raw = request("https://h.com/next?a=1", &origin, &headers);
+        let raw = String::from_utf8(raw).unwrap();
+        assert!(raw.starts_with("GET /next?a=1 HTTP/1.1\r\nHost: h.com\r\n"));
+        assert!(raw.contains("Authorization: Bearer token\r\nCookie: sid=123\r\n"));
+        for destination in ["http://h.com/", "https://other.com/", "https://h.com:8443/"] {
+            let raw = String::from_utf8(request(destination, &origin, &headers)).unwrap();
+            assert!(!raw.contains("token") && !raw.contains("sid="));
+        }
+        for bad in ["Host: evil", "Content-Length: 10", "Transfer-Encoding: chunked", "Bad name: a", "X: a\0b", "not a header"] {
+            assert!(custom_headers(bad).is_err(), "{bad}");
+        }
     }
 }

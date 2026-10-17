@@ -60,6 +60,8 @@ struct Project {
     repeater: crate::repeater::SavedState,
     #[serde(default)]
     organizer: crate::organizer::SavedState,
+    #[serde(default)]
+    intruder: crate::intruder::SavedState,
 }
 
 /// Known issue titles, so a loaded title becomes `&'static str` without leaking per load.
@@ -73,11 +75,12 @@ fn intern(title: &str) -> &'static str {
     Box::leak(title.to_string().into_boxed_str())
 }
 
-pub fn save(history: &History, repeater: &crate::repeater::Repeater, organizer: &crate::organizer::Organizer, path: &str) -> Result<(), String> {
+pub fn save(history: &History, repeater: &crate::repeater::Repeater, organizer: &crate::organizer::Organizer, intruder: &crate::intruder::Intruder, path: &str) -> Result<(), String> {
     let project = Project {
         magic: MAGIC.to_string(),
         repeater: repeater.save_state(),
         organizer: organizer.saved().clone(),
+        intruder: intruder.save_state(),
         flows: history
             .flows
             .iter()
@@ -118,7 +121,7 @@ pub fn save(history: &History, repeater: &crate::repeater::Repeater, organizer: 
     std::fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))
 }
 
-pub fn load(history: &mut History, repeater: &mut crate::repeater::Repeater, organizer: &mut crate::organizer::Organizer, path: &str) -> Result<usize, String> {
+pub fn load(history: &mut History, repeater: &mut crate::repeater::Repeater, organizer: &mut crate::organizer::Organizer, intruder: &mut crate::intruder::Intruder, path: &str) -> Result<usize, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     let mut json = Vec::new();
     GzDecoder::new(&bytes[..]).read_to_end(&mut json).map_err(|_| "not a gzipped ferrite project".to_string())?;
@@ -153,6 +156,7 @@ pub fn load(history: &mut History, repeater: &mut crate::repeater::Repeater, org
         .collect();
     let count = history.replace_all(flows, ws, issues);
     repeater.restore(project.repeater);
+    intruder.restore(project.intruder);
     organizer.restore(project.organizer);
     Ok(count)
 }
@@ -269,18 +273,22 @@ mod tests {
         let mut repeater = crate::repeater::Repeater::default();
         repeater.restore(project.repeater);
         assert!(repeater.is_empty());
+        let mut intruder = crate::intruder::Intruder::default();
+        intruder.restore(project.intruder);
+        assert!(intruder.is_empty());
     }
 
     #[test]
     fn har_round_trip_preserves_binary_bodies_and_timestamps() {
         let mut history = History::default();
+        let original_id = crate::history::next_id();
         let mut req = b"POST /upload?q=1 HTTP/1.1\r\nHost: a.com\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\n\r\n".to_vec();
         req.extend([0, 255, 128]);
-        history.on_request(1, "https://a.com/upload?q=1".into(), req);
+        history.on_request(original_id, "https://a.com/upload?q=1".into(), req);
         history.flows[0].created_ms = 1_792_200_000_123;
         let mut res = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
         res.extend([255, 0, 254]);
-        history.on_response(1, res, 42);
+        history.on_response(original_id, res, 42);
         let path = format!("/tmp/ferrite-har-roundtrip-{}.har.gz", std::process::id());
         export_har(&history, &path).unwrap();
         let mut imported = History::default();
@@ -290,7 +298,7 @@ mod tests {
         assert_eq!(Msg::parse(&flow.req).body, [0, 255, 128]);
         assert_eq!(Msg::parse(flow.res.as_ref().unwrap()).decoded_body(), [255, 0, 254]);
         assert_eq!(flow.ms, Some(42));
-        assert!(flow.id > 1 << 60);
+        assert_ne!(flow.id, original_id, "imported entries get fresh runtime identities");
         assert!(flow.note.contains("reconstructed"));
         std::fs::remove_file(path).unwrap();
     }
@@ -326,30 +334,37 @@ mod tests {
     fn round_trip() {
         let mut repeater = crate::repeater::Repeater::default();
         let mut organizer = crate::organizer::Organizer::default();
+        let mut intruder = crate::intruder::Intruder::default();
+        intruder.load(crate::http::Target::from_url("https://a.com/").unwrap(), b"GET /intruder?q=1 HTTP/1.1\r\nHost: a.com\r\n\r\n".to_vec());
         let mut h = History::default();
-        h.on_request(1, "https://a.com/x".into(), b"GET /x HTTP/1.1\r\nHost: a.com\r\n\r\n".to_vec());
-        h.on_response(1, b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<p>hi</p>".to_vec(), 12);
+        let original_id = crate::history::next_id();
+        h.on_request(original_id, "https://a.com/x".into(), b"GET /x HTTP/1.1\r\nHost: a.com\r\n\r\n".to_vec());
+        h.on_response(original_id, b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<p>hi</p>".to_vec(), 12);
         h.on_ws("wss://a.com/s".into(), true, true, b"ping".to_vec());
         let path = format!("{}/ferrite-test.ferrite", std::env::temp_dir().display());
         organizer.add("https://a.com/x".into(), h.flows[0].req.clone(), h.flows[0].res.clone());
         repeater.add(crate::http::Target::from_url("https://a.com/").unwrap(), b"GET /saved-tab HTTP/1.1\r\nHost: a.com\r\n\r\n".to_vec());
-        save(&h, &repeater, &organizer, &path).unwrap();
+        save(&h, &repeater, &organizer, &intruder, &path).unwrap();
         let mut h2 = History::default();
-        let n = load(&mut h2, &mut repeater, &mut organizer, &path).unwrap();
+        let n = load(&mut h2, &mut repeater, &mut organizer, &mut intruder, &path).unwrap();
         assert_eq!(n, 1);
         assert!(!repeater.is_empty(), "Repeater tabs should survive project load");
         assert!(!organizer.is_empty(), "Organizer snapshots should survive project load");
+        assert!(!intruder.is_empty(), "Intruder draft should survive project load");
         assert_eq!(h2.flows.len(), 1);
         assert_eq!(h2.flows[0].url, "https://a.com/x");
         assert_eq!(h2.flows[0].status, 200);
+        assert_ne!(h2.flows[0].id, original_id);
+        h2.on_response(original_id, b"HTTP/1.1 500 Stale response\r\n\r\n".to_vec(), 1);
+        assert_eq!(h2.flows[0].status, 200, "old in-flight responses cannot overwrite loaded flows");
         assert_eq!(h2.ws.len(), 1);
         assert!(!h2.issues.is_empty(), "passive scan should have run on load's source");
 
         // Notes survive a round trip.
         h2.flows[0].note = "interesting".into();
-        save(&h2, &repeater, &organizer, &path).unwrap();
+        save(&h2, &repeater, &organizer, &intruder, &path).unwrap();
         let mut h3 = History::default();
-        load(&mut h3, &mut repeater, &mut organizer, &path).unwrap();
+        load(&mut h3, &mut repeater, &mut organizer, &mut intruder, &path).unwrap();
         assert_eq!(h3.flows[0].note, "interesting");
 
         // HAR export produces valid JSON with one entry per flow.
@@ -376,11 +391,9 @@ pub fn import_har(history: &mut History, path: &str) -> Result<usize, String> {
     let har: serde_json::Value = serde_json::from_slice(&json).map_err(|e| format!("Invalid HAR JSON: {e}"))?;
     let entries = har.pointer("/log/entries").and_then(|v| v.as_array()).ok_or("HAR must contain log.entries")?;
     let imported = entries.iter().enumerate().map(|(i, e)| har_entry(e).map_err(|e| format!("HAR entry {}: {e}", i + 1))).collect::<Result<Vec<_>, _>>()?;
-    let mut id = history.flows.iter().map(|f| f.id).max().unwrap_or(0).max(1 << 60);
     let count = imported.len();
-    id.checked_add(count as u64).ok_or("History request id limit reached")?;
     for entry in imported {
-        id = id.checked_add(1).ok_or("History request id limit reached")?;
+        let id = crate::history::next_id();
         history.on_request(id, entry.url, entry.req);
         if let Some(res) = entry.res { history.on_response(id, res, entry.ms); }
         if let Some(&index) = history.index.get(&id) {

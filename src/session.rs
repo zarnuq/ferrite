@@ -131,7 +131,7 @@ impl Sessions {
     pub fn ui(&mut self, ui: &mut egui::Ui, capture: &mut bool) {
         ui.heading("Session cookie jar");
         ui.checkbox(capture, "Capture Set-Cookie from proxy and tool responses");
-        ui.label("Enable Use session cookies in Repeater, Crawler or Discovery to reuse captured cookies.");
+        ui.label("Enable Use session cookies in Repeater, Intruder, Crawler or Discovery to reuse captured cookies.");
         ui.weak("Cookies stay in memory and are bound to their source host. Path, Secure and expiration are respected; Domain does not expand delivery to subdomains.");
         ui.horizontal(|ui| {
             ui.label("URL"); ui.add(egui::TextEdit::singleline(&mut self.url).desired_width(300.0));

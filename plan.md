@@ -5,7 +5,7 @@ A Burp Suite-style intercepting proxy for web app pentesting, written in Rust wi
 ## Status (built, tested live)
 
 All 11 planned milestones plus extra Burp features are implemented and verified against real
-traffic and a local vulnerable server. ~6900 lines across 19 modules, 35 passing tests + 1 ignored
+traffic and a local vulnerable server. 23 modules, 44 passing tests + 1 ignored
 network test. Tabs: **Target** (site map + passive/active scan issues), **Proxy** history,
 **Intercept**, **Repeater**, **Intruder**, **Sequencer**, **Decoder**, **Comparer**, **Settings**.
 
@@ -94,7 +94,7 @@ Session-2 polish:
 ~6900 lines, 19 modules, 23 passing tests + 1 ignored network test. Release build is warning-clean.
 Everything above is verified live or by tests, including the Crawler's GUI run.
 
-### Session 4 — Burp-style investigation workflows (in progress, 2026-10-17)
+### Session 4 — Burp-style investigation workflows (2026-10-17)
 
 - **Crawler redirects:** Follow redirects toggle; redirects preserve link depth, pass through the
   same host/scope/request-budget checks, and loops terminate via URL deduplication. Connection
@@ -140,13 +140,99 @@ Everything above is verified live or by tests, including the Crawler's GUI run.
 - **Organizer:** independent request/response snapshots, editable names/tags/notes and progress
   states, searchable and scope-filterable, with message viewers and Send-to actions. Add to
   Organizer is available in the common request action menu; projects/autosave include its state.
-- **Validation:** 35 tests passed + 1 ignored before Organizer; full post-Organizer checks and
-  live Sessions/project/Organizer verification are next. Session tests include a real local server
-  rotating an authentication cookie and asserting the next request's Cookie header.
+- **Request conversions:** Repeater Inspector switches GET/POST while moving query/form
+  parameters, and converts flat form bodies to/from JSON. Repeated fields survive conversion;
+  unsupported nested JSON and unsafe method/body conversions report errors. Body framing updates.
+- **Project menu fix:** clicking the filename field no longer closes the menu. Response viewers
+  in Repeater default to Pretty so compressed bodies are readable.
+- **Live verification:** proxy response populated Sessions; Repeater `/private` returned 401
+  without cookie reuse and 200 with reuse, with the actual Cookie header visible in the request.
+  Added the successful exchange to Organizer, edited its name/tags/notes/progress, then restarted
+  Ferrite and restored history, Repeater and Organizer from autosave. Explicit project save was
+  verified by inspecting its gzip JSON. HAR import through the Project menu appended `/from-har`
+  as a second history entry with its original timestamp and reconstructed-HTTP annotation.
+- **Validation:** session tests include a real local server rotating an authentication cookie and
+  asserting the next request's Cookie header. Full current results are recorded below.
 
-Next: live checks for the new Sessions/project/Organizer flows, request method/body conversions,
-robust HTML parsing and authenticated crawler headers. Cookie jar is intentionally in-memory;
-full browser cookie policy and cross-subdomain delivery are not implemented.
+### Session 6 — authenticated crawling and Intruder analysis (2026-10-17)
+
+- **HTML parsing:** replaced link regex with `scraper`/HTML5 parsing. Handles unquoted attributes,
+  case-insensitive tags, HTML entities, the first `<base href>`, form actions, iframe/script/image
+  sources and related URL attributes. Ignores links inside comments and script strings. URL
+  resolution rejects embedded username/password credentials as well as unsupported protocols.
+- **Crawler authentication headers:** collapsible custom-header editor accepts Authorization,
+  Cookie and application headers, validated before starting. Custom headers are sent only to the
+  starting origin (scheme, host and port); redirects/links to another origin do not receive them.
+  Host, framing and connection-control headers are managed by the crawler and cannot be overridden.
+- **Intruder response analysis:** grep and regex extraction search headers plus decoded response
+  bodies, including gzip + chunked responses. Added payload/status/extraction/error text filtering,
+  Grep matches only and Errors only controls.
+- **Intruder sessions:** optional Use session cookies; displayed/stored requests and Logger entries
+  use the actual transmitted bytes. Responses immediately update the shared jar.
+- **Intruder Stop:** keeps the attack active until outstanding requests finish, interrupts long
+  dispatch delays promptly, and reports sent/not-sent counts. Unsent rows are marked `not sent`.
+  A completion event prevents starting overlapping attacks after Stop; completed task handles are
+  drained during dispatch. Test stops a 60-second-delay attack after its first response.
+- **Flow identity fix:** one process-wide allocator now serves Proxy, Crawler, HAR import and
+  project restoration. Loaded flows get fresh runtime IDs so stale in-flight responses cannot
+  overwrite restored history. Project round-trip coverage checks this explicitly.
+- **Validation:** `cargo test --locked --offline` outside the restricted sandbox: **42 passed,
+  0 failed, 1 ignored**. The ignored test contacts an external target. Local socket fixtures fail
+  with PermissionDenied inside the sandbox and must run with the existing cargo-test approval.
+  `cargo build --release --locked --offline` passed without warnings; `git diff --check` passed.
+  New HTML/header and Intruder behavior has automated coverage; its latest controls have not yet
+  had a dedicated live GUI walkthrough. Repository-wide rustfmt differences remain pre-existing.
+
+### Computer-switch handoff (2026-10-17)
+
+- **STOPPED / PAUSED:** user explicitly requested stopping feature work and making this handoff
+  before switching computers. The development goal is paused. Do not resume autonomously; wait
+  for the user to request continuation.
+- **Latest work after session 6:** Intruder generates requests lazily as workers need them rather
+  than expanding/copying the whole attack before dispatch. A million-request plan retains one
+  template and payload sets; only dispatched requests become result rows. Counts still show the
+  full planned total and how many were not sent after Stop.
+- **Target consistency:** results snapshot the actual attack target, so loading/editing a new
+  target does not send actions on earlier results to the wrong server. The results panel identifies
+  that target separately from the current draft.
+- **Intruder project persistence:** save/load and autosave now include target/template, payload
+  sets, processors, attack type, concurrency/delay, grep/extraction/filter settings, cookie reuse,
+  result target and request/response results. Restoring cancels dispatch from the previous attack,
+  rejects its stale events, never automatically resumes network requests, and marks requests that
+  were unfinished at save time. Legacy projects without Intruder state get a fresh Intruder.
+- **Latest verification:** `cargo test --locked --offline` with local socket permission: **44
+  passed, 0 failed, 1 ignored**. `cargo build --release --locked --offline` and `git diff --check`
+  passed. Tests cover lazy generation, oversized combination rejection, Stop interrupting a long
+  delay, result target preservation, Intruder persistence and stale-event rejection. Latest
+  Intruder persistence/lazy-dispatch UI changes have not had a dedicated live GUI walkthrough.
+- **Git:** earlier sessions are in commits `384c52d` and `11ab32b`. Session-6 work and this plan
+  update are currently **uncommitted**. Modified files: Cargo.toml, Cargo.lock, plan.md,
+  src/crawler.rs, src/history.rs, src/intruder.rs, src/main.rs, src/project.rs, src/proxy.rs and
+  src/session.rs. The latest Intruder changes described above are also uncommitted.
+  Transfer/sync these working-tree changes before continuing on another computer; a clone of HEAD
+  alone will not include them. No commit or push was requested or performed for this checkpoint.
+- **Run/check:** `cargo test --locked --offline`, `cargo build --release --locked --offline`, then
+  `target/release/ferrite 127.0.0.1:8080`. On another machine, the first build may need network
+  access for locked dependencies, including the newly added scraper 0.27.0.
+- **Temporary verification data (this machine only):** isolated settings/autosave under
+  `/tmp/ferrite-workflow-check/ferrite/`; explicit saved project `/tmp/ferrite-workflow.ferrite`;
+  HAR fixture `/tmp/ferrite-interop.har`; local server script `/tmp/ferrite-crawl-fixture.py`.
+  The explicit project contains one proxy flow, one Repeater tab with 401/200 exchanges and one
+  Organizer snapshot named "Private account check", tags "auth, retest", note "Retest with
+  another account", status In progress. The later autosave also includes the imported HAR flow.
+  These /tmp files are fixtures, not required application assets, and will not follow a git clone.
+- **Next work only if the user resumes:** live-check crawler header controls and Intruder
+  filters/Stop/project restoration. History/body retention and accumulated Intruder result bodies
+  remain memory-growth issues (Logger already has a cap; lazy generation fixes the upfront attack
+  expansion only). Then improve browser/proxy onboarding and continue Burp-style workflows.
+- **Runtime cleanup:** the isolated Ferrite GUI and local HTTP fixture were closed after the
+  verification session; final temporary autosave contains two flows, one Repeater tab and one
+  Organizer item. No new GUI or fixture process was launched for the latest Intruder work.
+- **Known limits:** cookie jar is intentionally in-memory and host-bound; full browser cookie
+  policy and cross-subdomain delivery are not implemented. Crawler does not execute JavaScript or
+  submit forms. A previous debug GUI process hit an epaint text-index overflow panic; no backtrace
+  was captured and it has not been reproduced in the current release. Investigate if it recurs;
+  do not treat the Pretty default as a confirmed fix.
 
 Open questions from the original plan, as resolved: listen address is a CLI arg; intercept catches
 responses and WebSockets too (toggle); Intruder has prefix/suffix/null-payload processors; settings

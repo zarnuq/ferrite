@@ -180,7 +180,9 @@ impl History {
     }
 
     /// Replaces all captured data (project load). Returns the flow count.
-    pub fn replace_all(&mut self, flows: Vec<Flow>, ws: Vec<WsMsg>, issues: Vec<Issue>) -> usize {
+    pub fn replace_all(&mut self, mut flows: Vec<Flow>, ws: Vec<WsMsg>, issues: Vec<Issue>) -> usize {
+        // Runtime identities must never match old, still-in-flight responses after a load.
+        for flow in &mut flows { flow.id = next_id(); }
         self.index = flows.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
         self.issue_keys = issues.iter().map(|i| format!("{} {}", i.title, i.url)).collect();
         let n = flows.len();
@@ -501,4 +503,10 @@ impl History {
             self.ws_selected = clicked;
         }
     }
+}
+
+/// Shared by the proxy, crawler, HAR importer and project restoration.
+pub fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

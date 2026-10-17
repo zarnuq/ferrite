@@ -29,7 +29,6 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
         mpsc::Sender,
     },
     task::{Context, Poll},
@@ -108,7 +107,7 @@ pub async fn run(
         .enable_http1()
         .enable_http2()
         .wrap_connector(Dialer(shared.clone()));
-    let handler = Handler { shared, tx, ui, next_id: Arc::default(), id: 0, url: String::new(), start: Instant::now(), record: true };
+    let handler = Handler { shared, tx, ui, id: 0, url: String::new(), start: Instant::now(), record: true };
     // ponytail: websocket upgrades connect directly, ignoring the upstream proxy; custom tungstenite connect if needed
     Proxy::builder()
         .with_addr(addr)
@@ -129,7 +128,6 @@ struct Handler {
     shared: Shared,
     tx: Sender<Event>,
     ui: egui::Context,
-    next_id: Arc<AtomicU64>,
     id: u64,
     url: String,
     start: Instant,
@@ -222,7 +220,7 @@ impl HttpHandler for Handler {
         if req.method() == Method::CONNECT {
             return req.into();
         }
-        self.id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.id = crate::history::next_id();
         self.start = Instant::now();
         self.url = req.uri().to_string();
         // ponytail: buffers whole bodies, so streaming bodies (SSE, long-poll) stall until done; stream-tee if it matters
