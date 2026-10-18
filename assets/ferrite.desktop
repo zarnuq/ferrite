@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ferrite
+GenericName=Intercepting Proxy
+Comment=Burp Suite-style intercepting proxy for web app pentesting
+Exec=ferrite
+Icon=applications-internet
+Terminal=false
+Categories=Network;Security;
+Keywords=proxy;mitm;pentest;burp;http;
+StartupWMClass=ferrite
