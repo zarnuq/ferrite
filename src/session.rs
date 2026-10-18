@@ -23,6 +23,17 @@ pub struct Jar { cookies: Vec<Cookie> }
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 
 impl Jar {
+    pub fn import_browser(&mut self,cookies:&serde_json::Value,origins:&[String]){
+        for cookie in cookies.as_array().into_iter().flatten().take(2000){
+            let host=cookie["domain"].as_str().unwrap_or("").trim_start_matches('.');let secure=cookie["secure"].as_bool().unwrap_or(false);
+            let source=origins.iter().filter_map(|o|url::Url::parse(o).ok()).find(|u|u.host_str()==Some(host)&&(!secure||u.scheme()=="https"));let Some(source)=source else{continue;};
+            let(name,value)=(cookie["name"].as_str().unwrap_or(""),cookie["value"].as_str().unwrap_or(""));if value.contains(';'){continue;}
+            let path=cookie["path"].as_str().unwrap_or("/");if !path.starts_with('/')||path.contains(';'){continue;}
+            let expiry=cookie["expires"].as_f64().filter(|t|*t>=0.0).map(|t|format!("; Max-Age={}",(t as u64).saturating_sub(now()))).unwrap_or_default();
+            let header=format!("{name}={value}; Path={path}{}{}{expiry}",if secure{"; Secure"}else{""},if cookie["httpOnly"].as_bool().unwrap_or(false){"; HttpOnly"}else{""});let _=self.set_cookie(source.as_str(),&header);
+        }
+    }
+
     pub fn is_empty(&self)->bool{self.cookies.is_empty()}
     pub fn restore(&mut self, saved: Self) {
         self.cookies.clear();
@@ -117,14 +128,16 @@ fn path_matches(cookie: &str, request: &str) -> bool {
 }
 
 #[derive(Clone)]
-pub struct Client { jar: Shared, reuse: bool, capture: bool, macros: Vec<crate::macros::Macro>, work: Option<crate::work::Work> }
+pub struct Client { jar: Shared, reuse: bool, capture: bool, macros: Vec<crate::macros::Macro>, work: Option<crate::work::Work>, auth:crate::browser_auth::Auth }
 
 impl Client {
-    pub fn new(jar: Shared, reuse: bool, capture: bool) -> Self { Self { jar, reuse, capture, macros: Vec::new(), work:None } }
+    pub fn new(jar: Shared, reuse: bool, capture: bool) -> Self { Self { jar, reuse, capture, macros: Vec::new(), work:None,auth:Default::default() } }
+    pub fn with_browser_auth(mut self,auth:crate::browser_auth::Auth)->Self{self.auth=auth;self}
     pub fn with_work(mut self, work: crate::work::Work) -> Self { self.work=Some(work); self }
     pub fn with_macros(mut self, macros: Vec<crate::macros::Macro>) -> Self { self.macros = macros; self }
     pub fn prepare(&self, target: &Target, request: &[u8]) -> Vec<u8> {
-        if self.reuse { self.jar.lock().unwrap().apply(target, request) } else { request.to_vec() }
+        let request=self.auth.apply(target,request);
+        if self.reuse { self.jar.lock().unwrap().apply(target, &request) } else { request }
     }
     pub fn capture(&self, target: &Target, request: &[u8], result: &Result<Reply, String>) {
         if !self.capture { return; }

@@ -258,6 +258,7 @@ impl Repeater {
         }
         if let Some((target, request,group,http2)) = duplicate { self.add(target, request); let t=&mut self.tabs[self.current];t.group=group;t.http2=http2; }
         let mut send_group = false;
+        let mut race_group=false;
         if let Some(tab) = self.tabs.get_mut(self.current) {
             ui.horizontal(|ui| {
                 ui.label("Group");
@@ -265,9 +266,11 @@ impl Repeater {
                 egui::ComboBox::from_id_salt("group_send_mode").selected_text(self.group_mode.label()).show_ui(ui, |ui| {
                     for (mode,label) in crate::groups::Mode::ALL { ui.selectable_value(&mut self.group_mode,mode,label); }
                 });
+                race_group=ui.add_enabled(!tab.group.is_empty(),egui::Button::new("Race group")).clicked();
                 send_group = ui.add_enabled(!tab.group.is_empty() && !tab.busy, egui::Button::new("Send group")).clicked();
             });
         }
+        if race_group{let tab=&self.tabs[self.current];let requests=self.tabs.iter().filter(|t|t.group==tab.group&&t.target.url()==tab.target.url()).map(|t|http::to_wire(&t.request,t.update_length)).collect();env.actions.push(crate::Action::Race(tab.target.clone(),requests));}
         if send_group { self.send_group(env); }
         let Some(tab) = self.tabs.get_mut(self.current) else {
             ui.add_space(20.0);

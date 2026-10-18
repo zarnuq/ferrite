@@ -19,7 +19,7 @@ async fn inspect(html: String, headers: Vec<(String, String)>) -> Result<Value, 
         id: 0,
         origin: url::Url::parse(&server.target.url()).unwrap().origin(),
         headers,
-        recorded: vec![],
+        recorded: vec![],allowed:Default::default(),
     };
     let result=async {
         cdp.command("Page.enable",json!({})).await?;
@@ -124,7 +124,7 @@ async fn workflow_replay_fills_clicks_asserts_messages_and_records_source_sink_t
         id: 0,
         origin: url::Url::parse(&server.target.url()).unwrap().origin(),
         headers: vec![],
-        recorded: vec![],
+        recorded: vec![],allowed:Default::default(),
     };
     let scope = crate::rules::Compiled::new(Default::default());
     let cancel = AtomicBool::new(false);

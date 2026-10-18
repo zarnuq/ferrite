@@ -62,7 +62,7 @@ async fn macros_refresh_token_and_cookie_before_actual_request(){
 #[tokio::test]
 async fn scripts_transform_requests_and_reject_invalid_protocol(){
     use crate::extensions::{Package,Script};
-    let mut package=Package{checks:vec![],scripts:vec![Script{name:"header".into(),enabled:true,origin:"http://example.com".into(),phase:"request".into(),command:vec!["python3".into(),"-c".into(),"import sys,json,base64;v=json.load(sys.stdin);s=base64.b64decode(v['raw_base64']).replace(b'Host: example.com',b'Host: example.com\\r\\nX-Hook: yes');print(json.dumps({'raw_base64':base64.b64encode(s).decode()}))".into()]}]};
+    let mut package=Package { version:1,name:String::new(),tools:vec![],panels:vec![],checks:vec![],scripts:vec![Script{name:"header".into(),enabled:true,origin:"http://example.com".into(),phase:"request".into(),command:vec!["python3".into(),"-c".into(),"import sys,json,base64;v=json.load(sys.stdin);s=base64.b64decode(v['raw_base64']).replace(b'Host: example.com',b'Host: example.com\\r\\nX-Hook: yes');print(json.dumps({'raw_base64':base64.b64encode(s).decode()}))".into()]}]};
     let raw=b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();let out=crate::extensions::hooks(&package,"request","http://example.com/",raw.clone()).await.unwrap();assert_eq!(Msg::parse(&out).header("x-hook"),Some("yes"));
     assert_eq!(crate::extensions::hooks(&package,"request","http://other.com/",raw.clone()).await.unwrap(),raw);
     package.scripts[0].command=vec!["python3".into(),"-c".into(),"print('{}')".into()];assert!(crate::extensions::hooks(&package,"request","http://example.com/",raw).await.is_err());

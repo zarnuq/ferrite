@@ -17,9 +17,12 @@ pub struct Context {
     pub settings: crate::rules::Config,
     pub cookies: crate::session::Jar,
     pub reviews: crate::reports::Saved,
+    pub callbacks:crate::callbacks::Saved,
     pub scans: Vec<crate::dashboard::SavedJob>,
 }
 
+const MAX_PROJECT_JSON:usize=512*1024*1024;
+pub(crate) fn bounded_read(reader:impl Read,limit:usize)->Result<Vec<u8>,String>{let mut out=Vec::new();reader.take(limit as u64+1).read_to_end(&mut out).map_err(|e|e.to_string())?;if out.len()>limit{return Err(format!("Project exceeds {limit} decompressed bytes"));}Ok(out)}
 const MAGIC: &str = "ferrite-project-v1";
 
 #[derive(Serialize, Deserialize)]
@@ -137,6 +140,7 @@ impl Project { pub fn with_context(mut self, context: Context) -> Self { self.co
 pub fn write_snapshot(project: Project, path: &str) -> Result<(), String> { write_snapshot_ref(&project,path) }
 pub fn write_snapshot_ref(project: &Project, path: &str) -> Result<(), String> {
     let json = serde_json::to_vec(&project).map_err(|e| e.to_string())?;
+    if json.len()>MAX_PROJECT_JSON{return Err("Project exceeds the 512 MiB JSON limit; previous save retained".into());}
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
     gz.write_all(&json).map_err(|e| e.to_string())?;
     let bytes = gz.finish().map_err(|e| e.to_string())?;
@@ -153,7 +157,11 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        #[cfg(test)]
+        if std::env::var("FERRITE_ATOMIC_CRASH").as_deref()==Ok("before-rename"){std::process::exit(137);}
         std::fs::rename(&tmp, path)?;
+        #[cfg(test)]
+        if std::env::var("FERRITE_ATOMIC_CRASH").as_deref()==Ok("after-rename"){std::process::exit(137);}
         std::fs::File::open(parent)?.sync_all()
     })();
     if result.is_err() { let _ = std::fs::remove_file(tmp); }
@@ -165,10 +173,11 @@ pub fn load(history: &mut History, repeater: &mut crate::repeater::Repeater, org
     load_with_context(history,repeater,organizer,intruder,path).map(|(n,_)|n)
 }
 pub fn load_with_context(history: &mut History, repeater: &mut crate::repeater::Repeater, organizer: &mut crate::organizer::Organizer, intruder: &mut crate::intruder::Intruder, path: &str) -> Result<(usize, Option<Context>), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let mut json = Vec::new();
-    GzDecoder::new(&bytes[..]).read_to_end(&mut json).map_err(|_| "not a gzipped ferrite project".to_string())?;
+    let file=std::fs::File::open(path).map_err(|e|format!("{path}: {e}"))?;
+    if file.metadata().map_err(|e|e.to_string())?.len()>256*1024*1024{return Err("Compressed project exceeds 256 MiB".into());}
+    let json=bounded_read(GzDecoder::new(file),MAX_PROJECT_JSON)?;
     let project: Project = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+    if let Some(context)=&project.context{context.settings.extensions.validate()?;context.settings.browser_auth.validate()?;}
     if project.magic != MAGIC {
         return Err(format!("unrecognised project format: {}", project.magic));
     }

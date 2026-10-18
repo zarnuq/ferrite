@@ -6,7 +6,7 @@ use crate::{
 };
 
 fn script(code: &str) -> Package {
-    Package {
+    Package { version:1,name:String::new(),tools:vec![],panels:vec![],
         checks: vec![],
         scripts: vec![Script {
             name: "fixture".into(),
@@ -34,7 +34,7 @@ fn package_validation_rejects_invalid_regexes_and_empty_matchers() {
         Check::default(),
     ] {
         assert!(
-            Package {
+            Package { version:1,name:String::new(),tools:vec![],panels:vec![],
                 checks: vec![check],
                 scripts: vec![]
             }
@@ -52,7 +52,7 @@ fn package_validation_enforces_counts_and_script_phase() {
         ..Default::default()
     };
     assert!(
-        Package {
+        Package { version:1,name:String::new(),tools:vec![],panels:vec![],
             checks: vec![valid; 201],
             scripts: vec![]
         }
@@ -157,7 +157,7 @@ fn passive_check_requires_enable_scope_status_and_decoded_match() {
     encoder.write_all(b"fixture-secret").unwrap();
     let body = encoder.finish().unwrap();
     let response = Reply::body(200, &[("Content-Encoding", "gzip")], &body).bytes;
-    let mut package = Package {
+    let mut package = Package { version:1,name:String::new(),tools:vec![],panels:vec![],
         checks: vec![Check {
             name: "fixture".into(),
             enabled: true,
@@ -199,7 +199,7 @@ async fn differential_active_checks_suppress_matches_already_in_baseline() {
             )
         })
         .await;
-        let package = Package {
+        let package = Package { version:1,name:String::new(),tools:vec![],panels:vec![],
             checks: vec![Check {
                 name: "differential".into(),
                 enabled: true,

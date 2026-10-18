@@ -63,65 +63,51 @@ fn endpoint(text: &str) -> Option<String> {
     }
     Some(format!("https://{text}"))
 }
-pub async fn run(
-    binary: String,
-    server: String,
-    cancel: Arc<AtomicBool>,
-    notify: impl Fn(Note),
-) -> Result<(), String> {
-    let path = std::env::temp_dir().join(format!("ferrite-oast-{}", crate::callbacks::token()?));
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(&path).map_err(|e| e.to_string())?;
-    let dir = Directory(path);
-    let payload = dir.0.join("payload.txt");
-    let mut command = tokio::process::Command::new(binary);
-    command
-        .args(["-json", "-n", "1", "-pi", "5", "-duc", "-ps", "-psf"])
-        .arg(&payload)
-        .current_dir(&dir.0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    if !server.trim().is_empty() {
-        command.arg("-server").arg(server.trim());
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Install interactsh-client or set its executable path: {e}"))?;
-    let stdout = child.stdout.take().ok_or("Client stdout unavailable")?;
-    let mut reader = BufReader::new(stdout);
-    let mut line = Vec::new();
-    let mut announced = false;
-    notify(Note::Status(
-        "Registering with Interactsh; polling every five seconds".into(),
-    ));
-    let result=async{
-        while !cancel.load(Ordering::Relaxed){
-            tokio::select!{
-                byte=reader.read_u8()=>match byte {
-                    Ok(b'\n')=>{if let Ok(text)=std::str::from_utf8(&line){if let Some(i)=interaction(text){notify(Note::Interaction(i));}}line.clear();},
-                    Ok(b)=>{if line.len()>=128*1024{return Err("Interactsh JSON line exceeded 128 KiB".into());}line.push(b);},
-                    Err(e) if e.kind()==std::io::ErrorKind::UnexpectedEof=>{if let Ok(text)=std::str::from_utf8(&line){if let Some(i)=interaction(text){notify(Note::Interaction(i));}}return Err("Interactsh client exited; check server availability and client configuration".into());},
-                    Err(e)=>return Err(e.to_string()),
-                },
-                _=tokio::time::sleep(Duration::from_millis(100))=>{}
-            }
-            if !announced && std::fs::metadata(&payload).is_ok_and(|m|m.len()<=4096){
-                if let Ok(text)=std::fs::read_to_string(&payload){if let Some(base)=text.lines().find_map(endpoint){notify(Note::Endpoint(base));announced=true;}}
-            }
-        }
-        Ok(())
-    }.await;
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    result
+#[cfg(test)]
+pub async fn run(binary:String,server:String,cancel:Arc<AtomicBool>,notify:impl Fn(Note))->Result<(),String>{run_inner(binary,server,None,cancel,notify).await}
+pub async fn run_saved(binary:String,server:String,session:Vec<u8>,cancel:Arc<AtomicBool>,notify:impl Fn(Note))->Result<(),String>{run_inner(binary,server,Some(session),cancel,notify).await}
+async fn stop(child:&mut tokio::process::Child){
+    if let Some(id)=child.id(){let _=tokio::process::Command::new("kill").args(["-INT",&id.to_string()]).status().await;}
+    if tokio::time::timeout(Duration::from_secs(2),child.wait()).await.is_err(){let _=child.kill().await;let _=child.wait().await;}
 }
+async fn run_inner(binary:String,server:String,saved:Option<Vec<u8>>,cancel:Arc<AtomicBool>,notify:impl Fn(Note))->Result<(),String>{
+    let path=std::env::temp_dir().join(format!("ferrite-oast-{}",crate::callbacks::token()?));let mut builder=std::fs::DirBuilder::new();
+    #[cfg(unix)]{use std::os::unix::fs::DirBuilderExt;builder.mode(0o700);}
+    builder.create(&path).map_err(|e|e.to_string())?;let dir=Directory(path);let payload=dir.0.join("payload.txt");let session=dir.0.join("session.yaml");
+    let persistent=saved.is_some();let mut checkpointed=false;
+    if let Some(saved)=saved{if saved.len()>65536{return Err("Interactsh session exceeds 64 KiB".into());}if !saved.is_empty(){crate::project::atomic_write(&session,&saved).map_err(|e|e.to_string())?;checkpointed=true;}}
+    loop {
+        let _=std::fs::remove_file(&payload);
+        let mut command=tokio::process::Command::new(&binary);command.args(["-auth=false","-json","-n","1","-pi","5","-duc","-ps","-psf"]).arg(&payload).current_dir(&dir.0).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+        if persistent{command.arg("-sf").arg(&session);}
+        if !server.trim().is_empty(){command.arg("-server").arg(server.trim());}
+        let mut child=command.spawn().map_err(|e|format!("Install interactsh-client or set its executable path: {e}"))?;
+        let mut reader=BufReader::new(child.stdout.take().ok_or("Client stdout unavailable")?);let mut line=Vec::new();let mut announced=false;let mut restart=false;
+        notify(Note::Status("Registering/resuming Interactsh; polling every five seconds".into()));
+        let result=async{
+            while !cancel.load(Ordering::Relaxed){
+                tokio::select!{
+                    byte=reader.read_u8()=>match byte{
+                        Ok(b'\n')=>{if let Ok(text)=std::str::from_utf8(&line){if let Some(i)=interaction(text){notify(Note::Interaction(i));}}line.clear();},
+                        Ok(b)=>{if line.len()>=128*1024{return Err("Interactsh JSON line exceeded 128 KiB".into());}line.push(b);},
+                        Err(e)if e.kind()==std::io::ErrorKind::UnexpectedEof=>return Err("Interactsh client exited; check server availability and client configuration".into()),
+                        Err(e)=>return Err(e.to_string()),
+                    },
+                    _=tokio::time::sleep(Duration::from_millis(100))=>{}
+                }
+                if !announced&&std::fs::metadata(&payload).is_ok_and(|m|m.len()<=4096){if let Ok(text)=std::fs::read_to_string(&payload){if let Some(base)=text.lines().find_map(endpoint){
+                    if persistent&&!checkpointed{restart=true;break;}notify(Note::Endpoint(base));announced=true;
+                }}}
+            }
+            Ok(())
+        }.await;
+        if persistent{stop(&mut child).await;}else{let _=child.kill().await;let _=child.wait().await;}
+        if persistent&&std::fs::metadata(&session).is_ok_and(|m|m.len()<=65536){if let Ok(bytes)=std::fs::read(&session){if !bytes.is_empty(){notify(Note::Session(bytes));checkpointed=true;}}}
+        if restart&&!checkpointed{return Err("Client did not save a resumable session on interrupt".into());}
+        if !restart||cancel.load(Ordering::Relaxed){return result;}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,4 +195,25 @@ while :; do sleep 1; done
             |n| matches!(n,Note::Interaction(i) if i.protocol=="DNS"&&i.payload.contains("probe"))
         ));
     }
+}
+
+#[cfg(test)]mod live_tests{
+    use super::*;
+    struct Abort(tokio::task::AbortHandle);impl Drop for Abort{fn drop(&mut self){self.0.abort();}}
+    async fn exercise(saved:Vec<u8>,previous:Option<String>)->Result<(Vec<u8>,String),String>{
+        let binary=std::env::var("FERRITE_INTERACTSH_CLIENT").map_err(|_|"Set FERRITE_INTERACTSH_CLIENT to the official executable")?;
+        let notes=Arc::new(std::sync::Mutex::new(Vec::new()));let collected=notes.clone();let cancel=Arc::new(AtomicBool::new(false));let flag=cancel.clone();
+        let task=tokio::spawn(async move{run_saved(binary,String::new(),saved,flag,|note|collected.lock().unwrap().push(note)).await});let _guard=Abort(task.abort_handle());
+        let result=async{
+            let base=tokio::time::timeout(Duration::from_secs(45),async{loop{if let Some(base)=notes.lock().unwrap().iter().find_map(|n|match n{Note::Endpoint(base)=>Some(base.clone()),_=>None}){break Ok(base);}if task.is_finished(){break Err("Client exited before registration");}tokio::time::sleep(Duration::from_millis(100)).await;}}).await.map_err(|_|"Public registration timed out")??;
+            let endpoint=previous.unwrap_or_else(||base.clone());let token=crate::callbacks::token()?;let target=crate::http::Target::from_url(&endpoint).ok_or("Invalid service URL")?;
+            let raw=format!("GET /ferrite-self-test-{token} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",target.host_header());crate::http::send(&target,raw.as_bytes(),&crate::http::Upstream::None).await?;
+            tokio::time::timeout(Duration::from_secs(30),async{loop{if notes.lock().unwrap().iter().any(|n|matches!(n,Note::Interaction(i)if i.protocol=="HTTP"&&i.payload.contains(&token))){break;}tokio::time::sleep(Duration::from_millis(100)).await;}}).await.map_err(|_|"Public HTTP callback was not polled")?;
+            Ok::<_,String>(base)
+        }.await;
+        cancel.store(true,Ordering::Relaxed);tokio::time::timeout(Duration::from_secs(5),task).await.map_err(|_|"Client did not stop")?.map_err(|e|e.to_string())??;
+        let base=result?;let saved=notes.lock().unwrap().iter().rev().find_map(|n|match n{Note::Session(bytes)=>Some(bytes.clone()),_=>None}).ok_or("No resumable session was saved")?;Ok((saved,base))
+    }
+    #[tokio::test]#[ignore="registers with a public Interactsh service; requires explicit network access and official client"]
+    async fn resumes_public_session(){let(saved,old)=exercise(vec![],None).await.unwrap();let(_,new)=exercise(saved,Some(old)).await.unwrap();assert!(!new.is_empty());eprintln!("Live Interactsh verification passed: encrypted polling, HTTP callback correlation, checkpoint and restart against the original payload.");}
 }

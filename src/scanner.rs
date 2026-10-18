@@ -226,7 +226,7 @@ const REDIRECT_HOST: &str = "ferrite-redirect.example";
 
 /// A parameter we can rewrite: index into the query or form-encoded body pairs.
 #[derive(Clone)]
-enum Point {
+pub(crate) enum Point {
     Query(usize),
     Body(usize),
     Cookie(usize),
@@ -264,7 +264,7 @@ fn multipart_points(m:&Msg)->Vec<(Point,String)> {
     out
 }
 
-fn points(m: &Msg) -> Vec<(Point, String)> {
+pub(crate) fn points(m: &Msg) -> Vec<(Point, String)> {
     let mut out = Vec::new();
     let target = m.first.split_whitespace().nth(1).unwrap_or("");
     if let Some((_, q)) = target.split_once('?') {
@@ -297,7 +297,7 @@ fn points(m: &Msg) -> Vec<(Point, String)> {
 }
 
 /// Replaces one parameter's value (appending to it when `append`) and returns wire bytes.
-fn inject(m: &Msg, point: &Point, payload: &str, append: bool) -> Vec<u8> {
+pub(crate) fn inject(m: &Msg, point: &Point, payload: &str, append: bool) -> Vec<u8> {
     let enc = utf8_percent_encode(payload, ENCODE).to_string();
     let set = |old: &str, new: &str| if append { format!("{old}{new}") } else { new.to_string() };
     let rewrite = |pairs: &str, idx: usize| -> String {

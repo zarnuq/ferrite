@@ -343,3 +343,12 @@ async fn individual_http2_client_send_applies_cookies_and_preserves_wire_evidenc
     assert_eq!(Msg::parse(&reply.raw).body, b"\0\xffpayload");
     drop(server);
 }
+
+#[tokio::test]
+async fn coalesced_http2_releases_all_complete_requests_and_preserves_binary_bodies(){
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();let captured=Arc::new(Mutex::new(Vec::new()));let record=captured.clone();
+    let _server=Abort(tokio::spawn(async move{let(io,_)=listener.accept().await.unwrap();let _=hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(io),service_fn(move|r:hyper::Request<hyper::body::Incoming>|{let record=record.clone();async move{let body=r.into_body().collect().await.unwrap().to_bytes();record.lock().unwrap().push(body.to_vec());Ok::<_,std::convert::Infallible>(Response::new(Full::new(body)))}})).await;}));
+    let target=Target::from_url(&format!("http://{address}")).unwrap();let jobs:Vec<_>=[b"\0\xffa".as_slice(),b"second",b"third"].iter().map(|b|request(&target,"POST","/",b)).collect();let out=tokio::time::timeout(DEADLINE,groups::send(target,jobs,Upstream::None,Mode::Coalesced)).await.unwrap();assert_eq!(out.len(),3);for(_,r)in out{assert_eq!(r.unwrap().status,200);}assert_eq!(captured.lock().unwrap().len(),3);assert!(captured.lock().unwrap().iter().any(|b|b==b"\0\xffa"));
+}
+#[tokio::test]
+async fn coalesced_limits_reject_before_connecting(){let target=Target::from_url("http://127.0.0.1:1/").unwrap();let raw=request(&target,"POST","/",&vec![0;33*1024]);let out=groups::send(target,vec![raw],Upstream::None,Mode::Coalesced).await;assert!(out[0].1.as_ref().err().unwrap().contains("32 KiB"));}

@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[derive(Clone)]
+#[derive(Clone,serde::Serialize,serde::Deserialize)]
 pub struct Interaction {
     pub time: u64,
     pub protocol: String,
@@ -19,6 +19,7 @@ pub struct Interaction {
 }
 pub enum Note {
     Endpoint(String),
+    Session(Vec<u8>),
     Interaction(Interaction),
     Status(String),
     Done,
@@ -39,7 +40,10 @@ pub struct Callbacks {
     selected: usize,
     binary: String,
     server: String,
+    session:Vec<u8>,
 }
+#[derive(Clone,Default,serde::Serialize,serde::Deserialize)]#[serde(default)]
+pub struct Saved{pub binary:String,pub server:String,pub session:Vec<u8>,pub base:String,pub probes:Vec<Probe>,pub tokens:Vec<String>,pub interactions:Vec<Interaction>}
 pub(crate) fn payload(base: &str, token: &str) -> String {
     if base.contains("{{token}}") {
         base.replace("{{token}}", token)
@@ -55,7 +59,7 @@ pub(crate) fn token() -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     Ok(b.iter().map(|b| format!("{b:02x}")).collect())
 }
-#[derive(Clone)]
+#[derive(Clone,serde::Serialize,serde::Deserialize)]
 pub struct Probe {
     pub token: String,
     pub url: String,
@@ -88,6 +92,9 @@ fn dns_question(data: &[u8]) -> Option<(String, usize)> {
     Some((labels.join("."), pos + 4))
 }
 impl Callbacks {
+    pub fn saved(&self)->Saved{Saved{binary:self.binary.clone(),server:self.server.clone(),session:self.session.clone(),base:self.base.clone(),probes:self.probes.clone(),tokens:self.tokens.clone(),interactions:self.interactions.clone()}}
+    pub fn restore(&mut self,saved:Saved){self.reset_project();self.binary=saved.binary;self.server=saved.server;self.session=saved.session.into_iter().take(65536).collect();self.base=saved.base;self.probes=saved.probes.into_iter().take(1000).collect();self.tokens=saved.tokens.into_iter().take(1000).collect();self.interactions=saved.interactions.into_iter().take(2000).collect();self.status="Callback session restored; click Start Interactsh to resume polling".into();}
+
     pub fn accepts(&self, run: u64) -> bool {
         run == self.run
     }
@@ -96,14 +103,14 @@ impl Callbacks {
         let run = self.run;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
-        let (binary, server) = (self.binary.clone(), self.server.clone());
+        let (binary, server,session) = (self.binary.clone(), self.server.clone(),self.session.clone());
         let (tx, ctx) = (env.tx.clone(), env.egui.clone());
         env.rt.spawn(async move {
             let notify = |note| {
                 let _ = tx.send(Event::Callback { run, note });
                 ctx.request_repaint();
             };
-            if let Err(e) = crate::interactsh::run(binary, server, cancel, &notify).await {
+            if let Err(e) = crate::interactsh::run_saved(binary, server,session,cancel, &notify).await {
                 notify(Note::Status(e));
             }
             notify(Note::Done);
@@ -114,6 +121,7 @@ impl Callbacks {
             cancel.store(true, Ordering::Relaxed);
         }
         self.run += 1;
+        self.session.clear();
         self.auth.clear();
         self.base.clear();
         self.poll.clear();
@@ -159,6 +167,7 @@ impl Callbacks {
             return;
         }
         match note {
+            Note::Session(bytes)=>self.session=bytes,
             Note::Endpoint(base) => {
                 self.base = format!(
                     "http://{{{{token}}}}.{}",
@@ -169,6 +178,7 @@ impl Callbacks {
                         .into();
             }
             Note::Interaction(i) => {
+                if self.interactions.iter().any(|old|old.protocol==i.protocol&&old.peer==i.peer&&old.payload==i.payload){return;}
                 self.interactions.push(i);
                 if self.interactions.len() > 2000 {
                     self.interactions.remove(0);

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "name": "Example testing tools",
+  "checks": [],
+  "scripts": [],
+  "tools": [{"name":"Robots request","enabled":false,"origin":"https://example.com","request":"GET /robots.txt HTTP/1.1\r\nHost: {{host}}\r\nConnection: close\r\n\r\n"}],
+  "panels": [{"name":"Page titles","enabled":false,"url_regex":"^https://example\\.com/","response_regex":"(?is)<title>(.*?)</title>"}]
+}

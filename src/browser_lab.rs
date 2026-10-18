@@ -47,7 +47,7 @@ async fn replay(
         let result=match step {
             Step::Navigate{url}=>{
                 let url=url::Url::parse(url).map_err(|e|e.to_string())?;
-                if url.origin()!=cdp.origin||!scope.in_scope(url.as_str())||!url.username().is_empty()||url.password().is_some(){return Err("Workflow navigation must remain on the starting origin and in scope".into());}
+                if (url.origin()!=cdp.origin&&!cdp.allowed.contains(&url.origin()))||(url.origin()==cdp.origin&&!scope.in_scope(url.as_str()))||!url.username().is_empty()||url.password().is_some(){return Err("Workflow navigation must remain on the starting origin and in scope".into());}
                 let nav=cdp.command("Page.navigate",json!({"url":url.as_str()})).await?;
                 if let Some(e)=nav["errorText"].as_str(){return Err(e.into());}
                 cdp.settle(300).await.map(|_|Value::Null)
@@ -71,6 +71,7 @@ struct Cdp {
     origin: url::Origin,
     headers: Vec<(String, String)>,
     recorded: Vec<Step>,
+    allowed:HashSet<url::Origin>,
 }
 impl Cdp {
     async fn command(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -92,11 +93,11 @@ impl Cdp {
                     if let Some(step)=v["params"]["payload"].as_str().and_then(|text|serde_json::from_str::<Step>(text).ok()){self.recorded.push(step);}
                 }
                 if v["method"]=="Fetch.requestPaused"{
-                    let request=&v["params"]["request"];let allowed=url::Url::parse(request["url"].as_str().unwrap_or("")).is_ok_and(|u|u.origin()==self.origin);
+                    let request=&v["params"]["request"];let request_origin=url::Url::parse(request["url"].as_str().unwrap_or("")).ok().map(|u|u.origin());let allowed=request_origin.as_ref().is_some_and(|o|o==&self.origin||self.allowed.contains(o));
                     self.id+=1;
                     let (method,params)=if allowed{
                         let mut headers:Vec<Value>=request["headers"].as_object().into_iter().flatten().map(|(k,v)|json!({"name":k,"value":v.as_str().unwrap_or("")})).collect();
-                        for(k,value)in &self.headers{headers.retain(|h|!h["name"].as_str().unwrap_or("").eq_ignore_ascii_case(k));headers.push(json!({"name":k,"value":value}));}
+                        for(k,value)in self.headers.iter().filter(|_|request_origin.as_ref()==Some(&self.origin)){headers.retain(|h|!h["name"].as_str().unwrap_or("").eq_ignore_ascii_case(k));headers.push(json!({"name":k,"value":value}));}
                         ("Fetch.continueRequest",json!({"requestId":v["params"]["requestId"],"headers":headers}))
                     }else{("Fetch.failRequest",json!({"requestId":v["params"]["requestId"],"errorReason":"BlockedByClient"}))};
                     self.socket.send(Message::Text(json!({"id":self.id,"method":method,"params":params}).to_string().into())).await.map_err(|e|e.to_string())?;
@@ -264,8 +265,10 @@ pub struct BrowserLab {
     status: String,
     steps_text: String,
     steps_error: String,
+    auth_text:String,export_session:bool,
 }
 impl BrowserLab {
+    pub fn accepts(&self,run:u64)->bool{run==self.run}
     pub fn reset_project(&mut self) {
         if let Some(cancel) = &self.cancel {
             cancel.store(true, Ordering::Relaxed);
@@ -319,7 +322,10 @@ impl BrowserLab {
             headers.push((k.to_string(), v.trim().to_string()));
         }
         let steps = scope.cfg.browser_steps.clone();
-        let cookies = env.jar.lock().unwrap().browser_cookies(start.as_str());
+        let auth=scope.cfg.browser_auth.clone();if let Err(e)=auth.validate(){self.status=e;return;}
+        let export_session=self.export_session;
+        let mut origins=auth.origins.clone();origins.push(start.origin().ascii_serialization());
+        let cookies:Vec<_>=origins.iter().flat_map(|o|env.jar.lock().unwrap().browser_cookies(o)).collect();
         let (run, max_pages, wait_ms, submit, probe) = (
             self.run + 1,
             self.max_pages.clamp(1, 200),
@@ -336,13 +342,15 @@ impl BrowserLab {
             let notify=|note|{let _=tx.send(Event::BrowserLab{run,note});ctx.request_repaint();};
             let(mut process,socket)=match Process::start(addr,record).await{Ok(p)=>p,Err(e)=>{notify(Note::Status(e));notify(Note::Done);return;}};
             let result=async{
-                let origin=start.origin();let mut cdp=Cdp{socket,id:0,origin:origin.clone(),headers,recorded:Vec::new()};
+                let origin=start.origin();let mut cdp=Cdp{socket,id:0,origin:origin.clone(),headers,recorded:Vec::new(),allowed:origins.iter().filter_map(|o|url::Url::parse(o).ok().map(|u|u.origin())).collect()};
                 cdp.command("Page.enable",json!({})).await?;
                 cdp.command("Runtime.enable",json!({})).await?;
                 cdp.command("Runtime.addBinding",json!({"name":"__ferriteRecord"})).await?;
                 cdp.command("Network.enable",json!({})).await?;
                 cdp.command("Fetch.enable",json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}]})).await?;
                 cdp.command("Network.setCookies",json!({"cookies":cookies})).await?;
+                cdp.command("DOMStorage.enable",json!({})).await?;
+                cdp.command("Page.addScriptToEvaluateOnNewDocument",json!({"source":auth.bootstrap()})).await?;
                 cdp.command("Page.addScriptToEvaluateOnNewDocument",json!({"source":include_str!("../assets/dom-probe.js")})).await?;
                 let mut queue=VecDeque::from([start.to_string()]);let mut seen=HashSet::new();
                 while let Some(mut url)=queue.pop_front(){
@@ -366,6 +374,19 @@ impl BrowserLab {
                     let links:Vec<_>=evidence["links"].as_array().into_iter().flatten().chain(evidence["forms"].as_array().into_iter().flatten()).filter_map(Value::as_str).filter_map(|u|crate::crawler::resolve(&rendered,u)).filter(|u|url::Url::parse(u).is_ok_and(|u|u.origin()==origin)&&scope.in_scope(u)).take(2000).collect();
                     for link in &links{if !seen.contains(link)&&queue.len()<2000{queue.push_back(link.clone());}}
                     notify(Note::Page(Page{url:rendered,links,evidence}));
+                    if export_session{
+                        let mut saved=auth.clone();
+                        for origin in &origins{
+                            let mut state=crate::browser_auth::Storage::default();for local in [true,false]{
+                                if let Ok(items)=cdp.command("DOMStorage.getDOMStorageItems",json!({"storageId":{"securityOrigin":origin,"isLocalStorage":local}})).await{
+                                    for pair in items["entries"].as_array().into_iter().flatten().take(500){if let(Some(k),Some(v))=(pair[0].as_str(),pair[1].as_str()){if k!="__ferrite_bootstrap"&&k.len()<=4096&&v.len()<=65536{if local{state.local.insert(k.into(),v.into());}else{state.session.insert(k.into(),v.into());}}}}
+                                }
+                            }
+                            saved.storage.insert(origin.clone(),state);
+                        }
+                        let cookies=cdp.command("Network.getAllCookies",json!({})).await?["cookies"].clone();
+                        saved.validate()?;let _=tx.send(Event::BrowserSession{run,auth:saved,cookies});ctx.request_repaint();
+                    }
                 }
                 Ok::<_,String>(())
             }.await;
@@ -393,6 +414,13 @@ impl BrowserLab {
             ui.checkbox(&mut self.probe, "Probe prototype pollution");
         });
         ui.collapsing("Authentication headers",|ui|{ui.label("Session jar cookies are copied into this isolated browser. Headers are restricted to the starting origin.");ui.add(egui::TextEdit::multiline(&mut self.headers).desired_rows(3).desired_width(f32::INFINITY));});
+        ui.collapsing("SSO and browser session",|ui|{
+            ui.checkbox(&mut self.export_session,"Export cookies and browser storage to this project after the run");
+            ui.label("Explicit SSO origins permit cross-origin login. Custom authentication headers remain on the starting origin. Saved token mappings can feed manual tools using session cookies.");
+            if self.auth_text.is_empty(){self.auth_text=serde_json::to_string_pretty(&crate::rules::current(env.shared).cfg.browser_auth).unwrap_or_default();}
+            ui.add(egui::TextEdit::multiline(&mut self.auth_text).desired_rows(6));
+            if ui.button("Apply browser authentication").clicked(){match serde_json::from_str::<crate::browser_auth::Auth>(&self.auth_text).map_err(|e|e.to_string()).and_then(|a|{a.validate()?;Ok(a)}){Ok(a)=>{env.actions.push(crate::Action::BrowserAuth(a));self.steps_error="Browser authentication saved".into();},Err(e)=>self.steps_error=e}}
+        });
         ui.collapsing("Workflow replay",|ui|{
             ui.label("JSON steps: navigate, fill, click, wait, assert_text, post_message. Replayed once on the first page. Saved with the project. Recordings can contain credentials.");
             if self.steps_text.is_empty(){self.steps_text=serde_json::to_string_pretty(&crate::rules::current(env.shared).cfg.browser_steps).unwrap_or_default();}
@@ -473,7 +501,7 @@ mod tests {
             id: 0,
             origin,
             headers: vec![],
-            recorded: vec![],
+            recorded: vec![],allowed:Default::default(),
         };
         let result=async {
             cdp.command("Page.enable",json!({})).await?;

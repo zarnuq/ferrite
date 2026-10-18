@@ -222,14 +222,16 @@ const MAX_DECODED: u64 = 64 << 20;
 
 /// Undoes a Content-Encoding value (possibly a comma list). `None` if unknown or corrupt.
 pub fn decode(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
+    if encoding.split(',').count()>8{return None;}
     let mut data = body.to_vec();
-    for enc in encoding.split(',').rev().map(|e| e.trim().to_ascii_lowercase()) {
+    for enc in encoding.split(',').take(8).collect::<Vec<_>>().into_iter().rev().map(|e| e.trim().to_ascii_lowercase()) {
         let mut out = Vec::new();
         let reader: Box<dyn Read> = match enc.as_str() {
             "identity" | "" => continue,
             "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(&data[..])),
             "deflate" => {
-                if flate2::read::ZlibDecoder::new(&data[..]).read_to_end(&mut out).is_ok() {
+                if flate2::read::ZlibDecoder::new(&data[..]).take(MAX_DECODED+1).read_to_end(&mut out).is_ok() {
+                    if out.len() as u64>MAX_DECODED{return None;}
                     data = out;
                     continue;
                 }
@@ -240,7 +242,8 @@ pub fn decode(encoding: &str, body: &[u8]) -> Option<Vec<u8>> {
             "zstd" => Box::new(zstd::stream::read::Decoder::new(&data[..]).ok()?),
             _ => return None,
         };
-        reader.take(MAX_DECODED).read_to_end(&mut out).ok()?;
+        reader.take(MAX_DECODED+1).read_to_end(&mut out).ok()?;
+        if out.len() as u64>MAX_DECODED{return None;}
         data = out;
     }
     Some(data)
@@ -267,11 +270,10 @@ pub fn dechunk(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
                 }
             }
         }
-        if buf.len() < pos + size + 2 {
-            return None;
-        }
+        let end=pos.checked_add(size)?;let next=end.checked_add(2)?;
+        if next>buf.len()||buf.get(end..next)!=Some(b"\r\n"){return None;}
         out.extend_from_slice(&buf[pos..pos + size]);
-        pos += size + 2;
+        pos=next;
     }
 }
 

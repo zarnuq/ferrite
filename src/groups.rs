@@ -5,9 +5,9 @@ use std::{sync::Arc, time::{Duration, Instant}};
 use tokio::io::AsyncWriteExt;
 
 #[derive(Clone, Copy, PartialEq, Default)]
-pub enum Mode { #[default] Sequence, Connection, Parallel, Http2 }
+pub enum Mode { #[default] Sequence, Connection, Parallel, Http2, Coalesced }
 impl Mode {
-    pub const ALL: [(Self, &'static str); 4] = [(Self::Sequence,"Sequence"), (Self::Connection,"Sequence / same connection"), (Self::Parallel,"Parallel / last-byte sync"), (Self::Http2,"Parallel / HTTP/2")];
+    pub const ALL: [(Self, &'static str); 5] = [(Self::Sequence,"Sequence"), (Self::Connection,"Sequence / same connection"), (Self::Parallel,"Parallel / last-byte sync"), (Self::Http2,"Parallel / HTTP/2"),(Self::Coalesced,"HTTP/2 / coalesced release")];
     pub fn label(self) -> &'static str { Self::ALL.iter().find(|(m,_)| *m == self).unwrap().1 }
 }
 
@@ -65,6 +65,7 @@ pub async fn send(target: Target, requests: Vec<Vec<u8>>, upstream: Upstream, mo
                 while let Some(result) = tasks.join_next().await { out.push(result.map_err(|e| e.to_string())?); }
                 Ok(out)
             }
+            Mode::Coalesced => crate::coalesced::send(target,requests,upstream).await,
             Mode::Http2 => h2(target, requests, upstream).await,
         }
     };
@@ -81,14 +82,7 @@ async fn h2(target: Target, requests: Vec<Vec<u8>>, upstream: Upstream) -> Resul
     use http_body_util::{BodyExt, Full, Limited};
     use hudsucker::hyper::{Request, Version};
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    let tcp = http::dial(&target.host, target.port, &upstream).await.map_err(|e| e.to_string())?;
-    let io: Box<dyn http::Stream> = if target.tls {
-        let mut cfg = http::insecure_tls(); cfg.alpn_protocols = vec![b"h2".to_vec()];
-        let name = hudsucker::rustls::pki_types::ServerName::try_from(target.host.clone()).map_err(|e| e.to_string())?;
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await.map_err(|e| e.to_string())?;
-        if tls.get_ref().1.alpn_protocol() != Some(b"h2") { return Err("Target did not negotiate HTTP/2".into()); }
-        Box::new(tls)
-    } else { Box::new(tcp) };
+    let io=h2_io(&target,&upstream).await?;
     let (sender, connection) = hudsucker::hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await.map_err(|e| e.to_string())?;
     let driver = tokio::spawn(connection);
     let gate = Arc::new(tokio::sync::Barrier::new(requests.len().max(1)));
@@ -118,4 +112,17 @@ async fn h2(target: Target, requests: Vec<Vec<u8>>, upstream: Upstream) -> Resul
     }).buffer_unordered(100).collect().await;
     driver.abort();
     Ok(result)
+}
+
+pub(crate) async fn h2_io(target:&Target,upstream:&Upstream)->Result<Box<dyn http::Stream>,String>{
+    let tcp = http::dial(&target.host, target.port, &upstream).await.map_err(|e| e.to_string())?;
+    let io: Box<dyn http::Stream> = if target.tls {
+        let mut cfg = http::insecure_tls(); cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let name = hudsucker::rustls::pki_types::ServerName::try_from(target.host.clone()).map_err(|e| e.to_string())?;
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await.map_err(|e| e.to_string())?;
+        if tls.get_ref().1.alpn_protocol() != Some(b"h2") { return Err("Target did not negotiate HTTP/2".into()); }
+        Box::new(tls)
+    } else { Box::new(tcp) };
+
+    Ok(io)
 }

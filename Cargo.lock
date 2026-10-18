@@ -1440,6 +1440,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "flate2",
+ "h2",
  "http-body-util",
  "httpdate",
  "hudsucker",

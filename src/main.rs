@@ -4,15 +4,20 @@ mod interactsh;
 mod callbacks;
 mod browser;
 mod browser_lab;
+mod browser_auth;
 mod comparer;
 mod crawler;
 mod decoder;
 mod discovery;
 mod history;
 mod groups;
+mod coalesced;
+mod races;
 mod extensions;
 #[cfg(test)]
 mod features_tests;
+#[cfg(test)]
+mod hardening;
 mod http;
 mod intercept;
 mod inspector;
@@ -29,6 +34,7 @@ mod repeater;
 mod retention;
 mod rules;
 mod scanner;
+mod deep_scan;
 mod search;
 mod sequencer;
 mod settings;
@@ -62,6 +68,7 @@ pub struct Pending {
 }
 
 pub enum Event {
+    BrowserSession{run:u64,auth:browser_auth::Auth,cookies:serde_json::Value},
     Request { id: u64, url: String, raw: Vec<u8> },
     Response { id: u64, raw: Vec<u8>, ms: u128 },
     Ws { url: String, outgoing: bool, text: bool, data: Vec<u8> },
@@ -88,6 +95,9 @@ pub enum Event {
 
 /// Cross-tab requests raised from context menus, applied after the frame's UI runs.
 pub enum Action {
+    Race(Target,Vec<Vec<u8>>),
+    BrowserAuth(browser_auth::Auth),
+    AuthHistory(Option<String>),
     BrowserSteps(Vec<browser_lab::Step>),
     Authorization(Target, Vec<u8>),
     Repeater(Target, Vec<u8>),
@@ -125,7 +135,7 @@ impl Env<'_> {
     }
 
     pub fn session(&self, reuse: bool) -> session::Client {
-        session::Client::new(self.jar.clone(), reuse, rules::current(self.shared).cfg.capture_cookies).with_macros(rules::current(self.shared).cfg.session_macros.clone())
+        session::Client::new(self.jar.clone(), reuse, rules::current(self.shared).cfg.capture_cookies).with_macros(rules::current(self.shared).cfg.session_macros.clone()).with_browser_auth(if reuse{rules::current(self.shared).cfg.browser_auth.clone()}else{Default::default()})
     }
 
     pub fn upstream(&self) -> http::Upstream {
@@ -135,6 +145,7 @@ impl Env<'_> {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
+    Races,
     Authorization,
     Target,
     Proxy,
@@ -193,6 +204,7 @@ struct App {
     extensions: extensions::Extensions,
     logger: logger::Logger,
     search: search::Search,
+    races:races::Races,
     authorization: authz::Authorization,
     sessions: session::Sessions,
     organizer: organizer::Organizer,
@@ -286,6 +298,7 @@ fn main() -> eframe::Result {
                 extensions: Default::default(),
                 logger: Default::default(),
                 search: Default::default(),
+                races:Default::default(),
                 authorization: Default::default(),
                 sessions: Default::default(),
                 organizer: Default::default(),
@@ -302,7 +315,7 @@ impl App {
         self.active_project.is_some() || settings!=Config::default() || !self.history.flows.is_empty() || !self.history.ws.is_empty() || !self.history.issues.is_empty() || !self.repeater.is_empty() || !self.organizer.is_empty() || !self.intruder.is_empty() || !self.sessions.jar.lock().unwrap().is_empty() || !self.reports.saved.is_empty() || !self.dashboard.is_empty()
     }
     fn snapshot(&self) -> project::Project {
-        project::snapshot(&self.history,&self.repeater,&self.organizer,&self.intruder).with_context(project::Context { settings:self.cfg.clone(), cookies:self.sessions.jar.lock().unwrap().clone(), reviews:self.reports.saved.clone(),scans:self.dashboard.saved() })
+        project::snapshot(&self.history,&self.repeater,&self.organizer,&self.intruder).with_context(project::Context { settings:self.cfg.clone(), cookies:self.sessions.jar.lock().unwrap().clone(), reviews:self.reports.saved.clone(),scans:self.dashboard.saved(),callbacks:self.callbacks.saved() })
     }
     fn load_project(&mut self, path: &str) -> Result<usize,String> {
         if let Some(task)=self.autosave_task.take(){let _=task.join();}
@@ -317,10 +330,13 @@ impl App {
         self.logger=Default::default(); self.target=Default::default();
         self.dashboard.restore(context.scans);
         self.stop_project_tools();
+        self.callbacks.restore(context.callbacks);
         self.active_project=Some(path.to_string());
         Ok(count)
     }
     fn stop_project_tools(&mut self) {
+        self.extensions=Default::default();
+        self.races=Default::default();
         self.authorization=Default::default();
         self.crawler.reset_project(); self.browser_lab.reset_project(); self.callbacks.reset_project(); self.ws_repeater.reset_project();
         self.discovery=Default::default(); self.sequencer=Default::default(); self.search=Default::default(); self.api=Default::default();
@@ -338,12 +354,14 @@ impl App {
     fn drain(&mut self) {
         for ev in self.rx.try_iter().chain(self.tool_rx.try_iter()) {
             match ev {
+                Event::BrowserSession{run,auth,cookies}=>{if self.browser_lab.accepts(run)&&auth.validate().is_ok(){let mut origins=auth.origins.clone();origins.extend(auth.storage.keys().cloned());self.sessions.jar.lock().unwrap().import_browser(&cookies,&origins);self.cfg.browser_auth=auth;}},
                 Event::Request { id, url, raw } => self.history.on_request(id, url, raw),
                 Event::Response { id, raw, ms } => {
                     if self.cfg.capture_cookies {
                         if let Some(flow) = self.history.flow(id) { self.sessions.jar.lock().unwrap().capture(&flow.url, &raw); }
                     }
                     if let Some(flow) = self.history.flow(id) {
+                        self.extensions.observe(&self.cfg.extensions,&flow.url,&raw);
                         let issues = extensions::passive(&self.cfg.extensions, &flow.url, &flow.req, &raw);
                         for issue in issues { self.history.add_issue(format!("custom {} {}",issue.url,issue.detail),issue); }
                     }
@@ -387,6 +405,9 @@ impl App {
     fn apply(&mut self, actions: Vec<Action>) {
         for a in actions {
             match a {
+                Action::Race(t,requests)=>{self.races.load(t,requests);self.tab=Tab::Races;},
+                Action::BrowserAuth(auth)=>self.cfg.browser_auth=auth,
+                Action::AuthHistory(prefix)=>{let scope=Compiled::new(self.cfg.clone());let requests=self.history.flows.iter().filter(|f|scope.in_scope(&f.url)&&prefix.as_ref().is_none_or(|p|url::Url::parse(p).ok().zip(url::Url::parse(&f.url).ok()).is_some_and(|(p,u)|p.origin()==u.origin()&&u.path().starts_with(p.path())))).filter_map(|f|Target::from_url(&f.url).map(|t|(t,http::to_http1(&f.req,&Target::from_url(&f.url).unwrap().host_header())))).take(100).collect();self.authorization.queue(requests);self.tab=Tab::Authorization;},
                 Action::BrowserSteps(steps) => self.cfg.browser_steps=steps,
                 Action::Authorization(t,raw) => { self.authorization.load(t,raw); self.tab=Tab::Authorization; }
                 Action::Organize(url, request, response) => {
@@ -517,6 +538,7 @@ impl eframe::App for App {
                     (Tab::Reports, "Reports".into()),
                     (Tab::Sessions, "Sessions".into()),
                     (Tab::Authorization, "Authorization".into()),
+                    (Tab::Races,"Race lab".into()),
                     (Tab::Extensions, "Extensions".into()),
                     (Tab::Settings, "Settings".into()),
                 ];
@@ -659,6 +681,7 @@ impl eframe::App for App {
                 Tab::Decoder => self.decoder.ui(ui),
                 Tab::Comparer => self.comparer.ui(ui),
                 Tab::Settings => settings::ui(ui, &mut self.cfg),
+                Tab::Races=>self.races.ui(ui,&mut env),
                 Tab::Authorization => self.authorization.ui(ui,&mut env),
                 Tab::Sessions => self.sessions.ui(ui, &mut self.cfg),
                 Tab::Organizer => self.organizer.ui(ui, &mut env),
@@ -820,6 +843,7 @@ pub fn editor(ui: &mut egui::Ui, id: &str, text: &mut String) -> egui::text_edit
 
 /// Context-menu entries shared by every place that shows a request.
 pub fn send_menu(ui: &mut egui::Ui, env: &mut Env, url: &str, req: &[u8], res: Option<&[u8]>) {
+    extensions::menu(ui,env,url);
     if ui.button("Add to Organizer").clicked() {
         env.actions.push(Action::Organize(url.to_string(), req.to_vec(), res.map(<[u8]>::to_vec)));
         ui.close();
@@ -830,6 +854,7 @@ pub fn send_menu(ui: &mut egui::Ui, env: &mut Env, url: &str, req: &[u8], res: O
             env.actions.push(Action::Repeater(t.clone(), req.to_vec()));
             ui.close();
         }
+        if ui.button("Send to Race lab").clicked(){env.actions.push(Action::Race(t.clone(),vec![crate::http::to_http1(req,&t.host_header())]));ui.close();}
         if ui.button("Test authorization").clicked() {
             env.actions.push(Action::Authorization(t.clone(), req.to_vec())); ui.close();
         }

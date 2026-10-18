@@ -109,6 +109,7 @@ fn host_scope_menu(ui: &mut egui::Ui, env: &mut Env, origin: &str) {
         env.actions.push(crate::Action::AddScope(origin.to_string()));
         ui.close();
     }
+    if ui.button("Queue host for authorization testing").clicked(){env.actions.push(crate::Action::AuthHistory(Some(origin.to_string())));ui.close();}
     if ui.button("Copy origin").clicked() {
         ui.ctx().copy_text(origin.to_string());
         ui.close();
