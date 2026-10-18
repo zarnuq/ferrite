@@ -7,7 +7,7 @@ Burp-style intercepting proxy, Rust + egui (`eframe` 0.37), `hudsucker` for MITM
 - `src/main.rs` — app state, `Tab` enum, `Event` (runtime → UI) and `Action` (cross-tab) enums,
   module list. Each tool is one module in `src/`.
 - Tests: `src/*_tests.rs`, `src/robust_tests/`, `src/tests/`; `#[cfg(test)] mod hardening`.
-- `assets/` — `dom-probe.js` (Browser Lab), `ferrite.desktop` (menu entry; name must match
+- `assets/` — `dom-probe.js` (Browser Lab), `ferrite.desktop` + `ferrite.svg` (menu entry and icon; names must match
   the `with_app_id("ferrite")` in main.rs).
 - `sdk/ferrite_sdk.py` + `examples/extensions/` — Python extension API.
 - `plan.md` — full session-by-session history and decisions. `TESTING.md` — test runner and
@@ -29,7 +29,7 @@ One ignored test hits an external target. `cargo fmt --check` has pre-existing d
 Live ebuild: `/home/miles/Projects/gentoo-overlay/net-proxy/ferrite/ferrite-9999.ebuild`
 (repo github.com/zarnuq/gentoo-overlay, synced to `/var/db/repos/zarnuq`).
 Update it when install-time files, runtime deps, or the Rust edition/MSRV change. It installs
-the cargo binary and `assets/ferrite.desktop` via `domenu`.
+the cargo binary, `assets/ferrite.desktop` (`domenu`) and `assets/ferrite.svg` (`doicon`).
 
 ## Recent changes
 
@@ -37,4 +37,4 @@ the cargo binary and `assets/ferrite.desktop` via `domenu`.
   repeater groups, extensions, robust regression suites, TESTING.md and docs/WORKFLOWS.md.
 - `f82a699` — Races tab, browser-auth session capture, deep-scan differential probes, coalesced
   HTTP/2 frame flushing for race groups, hardening tests, extension SDK example.
-- Desktop entry added (`assets/ferrite.desktop`) and installed by the ebuild.
+- Desktop entry + SVG icon added (`assets/`), installed by the ebuild.

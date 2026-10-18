@@ -38,7 +38,7 @@ and point its proxy at the listen address, or use **Open Chromium**.
 ## Install (Gentoo)
 
 A live ebuild is in the [zarnuq overlay](https://github.com/zarnuq/gentoo-overlay)
-(`net-proxy/ferrite`). It installs the binary and `assets/ferrite.desktop`.
+(`net-proxy/ferrite`). It installs the binary, desktop entry and icon.
 
 ```sh
 eselect repository add zarnuq git https://github.com/zarnuq/gentoo-overlay.git
@@ -46,7 +46,8 @@ emaint sync -r zarnuq
 emerge net-proxy/ferrite
 ```
 
-On other distros, copy `assets/ferrite.desktop` to `~/.local/share/applications/`.
+On other distros, copy `assets/ferrite.desktop` to `~/.local/share/applications/` and
+`assets/ferrite.svg` to `~/.local/share/icons/hicolor/scalable/apps/`.
 
 ## Tests
 
