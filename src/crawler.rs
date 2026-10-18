@@ -133,6 +133,8 @@ pub enum Note {
 }
 
 impl Crawler {
+    pub fn reset_project(&mut self){if let Some(cancel)=&self.cancel{cancel.store(true,Ordering::Relaxed);}self.run+=1;self.cancel=None;}
+
     pub fn load(&mut self, url: String) {
         self.start = url;
     }
@@ -425,7 +427,7 @@ mod tests {
                 start: format!("http://127.0.0.1:{port}{start_path}#fragment"),
                 max_pages, max_depth, scope_only, follow_redirects, ..Default::default()
             };
-            crawler.start_crawl(&Env {
+            crawler.start_crawl(&Env { listen_addr: "127.0.0.1:8080".parse().unwrap(),
                 rt: &tokio::runtime::Handle::current(), tx: &tx,
                 egui: &egui::Context::default(), shared: &shared, jar: &Arc::default(), actions: &mut actions,
             });
@@ -468,7 +470,7 @@ mod tests {
         let shared = Arc::new(RwLock::new(Arc::new(rules::Compiled::new(cfg))));
         let (tx, rx) = mpsc::channel();
         let mut actions = Vec::new();
-        let env = Env {
+        let env = Env { listen_addr: "127.0.0.1:8080".parse().unwrap(),
             rt: &tokio::runtime::Handle::current(), tx: &tx,
             egui: &egui::Context::default(), shared: &shared, jar: &Arc::default(), actions: &mut actions,
         };

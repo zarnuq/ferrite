@@ -197,6 +197,22 @@ enum Col {
     Extract,
 }
 
+#[derive(Clone,PartialEq,Default,Serialize,Deserialize)]
+#[serde(default)]
+struct Processing { transform:String, find:String, replace:String }
+impl Processing {
+    fn apply(&self,value:&str)->Result<String,String>{
+        use base64::Engine;
+        use sha2::Digest;
+        let value=if self.find.is_empty(){value.to_string()}else{Regex::new(&self.find).map_err(|e|e.to_string())?.replace_all(value,self.replace.as_str()).into_owned()};
+        Ok(match self.transform.as_str(){
+            "Base64"=>base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+            "SHA-256"=>sha2::Sha256::digest(value.as_bytes()).iter().map(|b|format!("{b:02x}")).collect(),
+            "Lowercase"=>value.to_lowercase(),"Uppercase"=>value.to_uppercase(),
+            _=>value,
+        })
+    }
+}
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct SavedDraft {
     target: Target,
@@ -206,6 +222,10 @@ struct SavedDraft {
     set: usize,
     load_path: String,
     numbers: (i64, i64, i64),
+    #[serde(default)]
+    processing: Processing,
+    #[serde(default)]
+    pool: String,
     encode: bool,
     prefix: String,
     suffix: String,
@@ -225,6 +245,8 @@ struct SavedResults {
     target: Target,
     total: usize,
     rows: Vec<Row>,
+    #[serde(default)] row_base: usize,
+    #[serde(default)] plan: Option<SavedDraft>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -243,6 +265,11 @@ pub struct Intruder {
     set: usize,
     load_path: String,
     numbers: (i64, i64, i64),
+    processing: Processing,
+    pool: String,
+    control: Option<Arc<crate::work::Control>>,
+    result_draft: Option<SavedDraft>,
+    row_base: usize,
     encode: bool,
     prefix: String,
     suffix: String,
@@ -279,6 +306,7 @@ impl Default for Intruder {
             set: 0,
             load_path: String::new(),
             numbers: (1, 100, 1),
+            processing: Default::default(),pool:"Default".into(),control:None,result_draft:None,row_base:0,
             encode: true,
             prefix: String::new(),
             suffix: String::new(),
@@ -309,6 +337,7 @@ impl Intruder {
     fn draft(&self) -> SavedDraft {
         SavedDraft { target: self.target.clone(), template: self.template.clone(), attack: self.attack,
             sets: self.sets.clone(), set: self.set, load_path: self.load_path.clone(), numbers: self.numbers,
+            processing:self.processing.clone(),pool:self.pool.clone(),
             encode: self.encode, prefix: self.prefix.clone(), suffix: self.suffix.clone(), repeat: self.repeat,
             extract: self.extract.clone(), threads: self.threads, delay_ms: self.delay_ms, grep: self.grep.clone(),
             filter: self.filter.clone(), grep_only: self.grep_only, errors_only: self.errors_only, use_cookies: self.use_cookies }
@@ -320,11 +349,12 @@ impl Intruder {
 
     pub fn save_state(&self) -> SavedState {
         SavedState { draft: Some(self.draft()), results: self.result_target.as_ref().map(|target|
-            SavedResults { target: target.clone(), total: self.total, rows: self.rows.clone() }) }
+            SavedResults { target: target.clone(), total: self.total, rows: self.rows.clone(),row_base:self.row_base,plan:self.result_draft.clone() }) }
     }
 
     pub fn restore(&mut self, state: SavedState) {
         if let Some(cancel) = &self.cancel { cancel.store(true, Ordering::Relaxed); }
+        if let Some(control)=&self.control{control.cancelled.store(true,Ordering::Relaxed);}
         let attack_id = self.attack_id + 1;
         *self = Self::default();
         self.attack_id = attack_id;
@@ -337,6 +367,7 @@ impl Intruder {
             self.set = draft.set.min(self.sets.len() - 1);
             self.load_path = draft.load_path;
             self.numbers = (draft.numbers.0, draft.numbers.1, draft.numbers.2.max(1));
+            self.processing=draft.processing;self.pool=draft.pool;
             self.encode = draft.encode;
             self.prefix = draft.prefix;
             self.suffix = draft.suffix;
@@ -351,16 +382,17 @@ impl Intruder {
             self.use_cookies = draft.use_cookies;
         }
         if let Some(results) = state.results {
+            self.row_base=results.row_base.min(MAX_REQUESTS);self.result_draft=results.plan;
             self.result_target = Some(results.target);
-            self.rows = results.rows;
-            self.total = results.total.max(self.rows.len());
+            self.rows = results.rows.into_iter().take(crate::retention::ROWS.min(MAX_REQUESTS-self.row_base)).collect();
+            self.total = results.total.max(self.row_base+self.rows.len()).min(MAX_REQUESTS);
             for row in &mut self.rows {
                 if !row.done {
                     row.done = true;
                     row.error = "Request was unfinished when this project was saved".into();
                 }
             }
-            self.done = self.rows.len();
+            self.done = self.row_base+self.rows.len();
             self.message = format!("Restored {} results; attacks are not resumed automatically", self.done);
         }
     }
@@ -371,7 +403,7 @@ impl Intruder {
     }
 
     pub fn on_queued(&mut self, attack: u64, idx: usize, payloads: String, request: Vec<u8>) {
-        if attack != self.attack_id || idx != self.rows.len() { return; }
+        if attack != self.attack_id || idx != self.row_base+self.rows.len() { return; }
         self.rows.push(Row { payloads, req: request, res: None, status: 0, ms: 0,
             error: String::new(), grep: false, extract: String::new(), done: false });
     }
@@ -380,9 +412,9 @@ impl Intruder {
         if attack != self.attack_id {
             return;
         }
-        let Some(row) = self.rows.get_mut(idx) else { return };
+        let Some(row) = idx.checked_sub(self.row_base).and_then(|i|self.rows.get_mut(i)) else { return };
         if row.done { return; }
-        row.req = request;
+        row.req = crate::retention::clip(request);
         row.done = true;
         self.done += 1;
         match result {
@@ -391,9 +423,20 @@ impl Intruder {
                 row.ms = r.elapsed.as_millis();
                 row.grep = grep_match(&self.grep, &r.raw);
                 row.extract = extract(&self.extract, &r.raw);
-                row.res = Some(r.raw);
+                row.res = Some(crate::retention::clip(r.raw));
             }
             Err(e) => row.error = e,
+        }
+    }
+
+    pub fn enforce_limits(&mut self) {
+        let mut bytes = 0;
+        for row in self.rows.iter_mut().rev() {
+            bytes += row.req.len() + row.res.as_ref().map_or(0, Vec::len);
+            if bytes > crate::retention::BYTES && row.done {
+                row.req.clear(); row.res = None;
+                if row.error.is_empty() { row.error = "Evidence evicted by 64 MiB retention limit".into(); }
+            }
         }
     }
 
@@ -415,18 +458,15 @@ impl Intruder {
         }
     }
 
-    fn start(&mut self, env: &Env) {
-        let sets: Vec<Vec<String>> = self
-            .sets
-            .iter()
-            .map(|s| {
-                s.lines()
-                    .map(|p| format!("{}{p}{}", self.prefix, self.suffix))
-                    .map(|p| if self.encode { utf8_percent_encode(&p, PAYLOAD_ENCODE).to_string() } else { p })
-                    .collect()
-            })
-            .collect();
-        let requests = match AttackPlan::new(&self.template, self.attack, sets, self.repeat) {
+    fn start(&mut self, env: &Env, resume:bool) {
+        let draft=if resume{match &self.result_draft{Some(d)=>d.clone(),None=>return}}else{self.draft()};
+        let sets: Result<Vec<Vec<String>>,String> = draft.sets.iter().map(|s|s.lines().map(|p|{
+            let p=draft.processing.apply(p)?;
+            let p=format!("{}{p}{}",draft.prefix,draft.suffix);
+            Ok(if draft.encode{utf8_percent_encode(&p,PAYLOAD_ENCODE).to_string()}else{p})
+        }).collect()).collect();
+        let sets=match sets{Ok(s)=>s,Err(e)=>{self.message=e;return;}};
+        let mut requests = match AttackPlan::new(&draft.template, draft.attack, sets, draft.repeat) {
             Ok(r) if r.len() == 0 => {
                 self.message = "No payloads.".into();
                 return;
@@ -439,27 +479,35 @@ impl Intruder {
         };
         self.message.clear();
         self.attack_id += 1;
-        self.done = 0;
-        self.total = requests.len();
-        self.result_target = Some(self.target.clone());
-        self.selected = None;
-        self.rows.clear();
+        self.total=requests.len();
+        let start=if resume{self.row_base+self.rows.len()}else{0};
+        if start>=self.total{self.message="No unsent payloads remain".into();return;}
+        requests.cursor=start;
+        if !resume{self.rows.clear();self.row_base=0;self.done=0;}
+        if self.rows.len()>=crate::retention::ROWS{self.row_base+=self.rows.len();self.rows.clear();}
+        self.result_target=Some(draft.target.clone());self.result_draft=Some(draft.clone());
+        self.selected=None;
+        let end=(self.row_base+crate::retention::ROWS).min(self.total);
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
-        let (tx, ui, target, upstream) = (env.tx.clone(), env.egui.clone(), self.target.clone(), env.upstream());
-        let (attack, threads, delay) = (self.attack_id, self.threads.max(1), self.delay_ms);
-        let session = env.session(self.use_cookies);
+        let (tx, ui, target, upstream) = (env.tx.clone(), env.egui.clone(), draft.target.clone(), env.upstream());
+        let (attack, threads, delay) = (self.attack_id, draft.threads.clamp(1,200), draft.delay_ms.min(60_000));
+        let control=Arc::new(crate::work::Control::default());self.control=Some(control.clone());
+        let pool=crate::rules::current(env.shared).cfg.resource_pools.iter().find(|p|p.name==draft.pool).cloned().unwrap_or_default();
+        let session = env.session(draft.use_cookies).with_work(crate::work::Work::new(pool,control.clone()));
         env.rt.spawn(async move {
             let limit = Arc::new(tokio::sync::Semaphore::new(threads));
             let mut tasks = tokio::task::JoinSet::new();
-            let mut requests = requests.enumerate();
+            let mut requests = (start..).zip(requests);
             loop {
                 while tasks.try_join_next().is_some() {}
+                if control.ready().await.is_err(){break;}
                 let permit = limit.clone().acquire_owned().await.unwrap();
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 let Some((idx, (payloads, text))) = requests.next() else { break; };
+                if idx >= end { break; }
                 let raw = http::to_wire(&text, true);
                 let _ = tx.send(Event::IntruderQueued { attack, idx, payloads: payloads.join(", "), request: raw.clone() });
                 ui.request_repaint();
@@ -488,6 +536,7 @@ impl Intruder {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, env: &mut Env) {
         let running = self.cancel.is_some();
+        ui.weak("Each batch sends up to 10,000 requests. Resume sends only unqueued payloads using the original plan. Unfinished saved requests are not replayed. Older batches can be evicted; evidence is limited to 64 MiB.");
         ui.horizontal(|ui| {
             ui.label("Target");
             ui.add(egui::TextEdit::singleline(&mut self.target.host).desired_width(200.0));
@@ -507,15 +556,18 @@ impl Intruder {
             ui.add(egui::DragValue::new(&mut self.delay_ms).range(0..=60_000));
             ui.separator();
             if running {
+                if let Some(control)=&self.control{let paused=control.paused.load(Ordering::Relaxed);if ui.button(if paused{"Resume"}else{"Pause"}).clicked(){control.paused.store(!paused,Ordering::Relaxed);}}
                 if ui.button("Stop").clicked() {
                     if let Some(c) = &self.cancel {
                         c.store(true, Ordering::Relaxed);
+                        if let Some(control)=&self.control{control.paused.store(false,Ordering::Relaxed);}
                         self.message = "Stopping; waiting for active requests…".into();
                     }
                 }
             } else if ui.button("Start attack").clicked() {
-                self.start(env);
+                self.start(env,false);
             }
+            if !running && self.result_draft.is_some() && self.row_base+self.rows.len()<self.total && ui.button("Resume unsent payloads").clicked(){self.start(env,true);}
             ui.checkbox(&mut self.use_cookies, "Use session cookies");
             if !self.rows.is_empty() {
                 ui.label(format!("{}/{} done", self.done, self.total));
@@ -523,6 +575,11 @@ impl Intruder {
             ui.colored_label(egui::Color32::LIGHT_RED, &self.message);
         });
 
+        ui.collapsing("Payload processing and resource pool",|ui|{
+            egui::ComboBox::from_id_salt("intruder_pool").selected_text(&self.pool).show_ui(ui,|ui|{for p in &crate::rules::current(env.shared).cfg.resource_pools{ui.selectable_value(&mut self.pool,p.name.clone(),&p.name);}});
+            egui::ComboBox::from_id_salt("payload_transform").selected_text(if self.processing.transform.is_empty(){"None"}else{&self.processing.transform}).show_ui(ui,|ui|{for name in ["None","Base64","SHA-256","Lowercase","Uppercase"]{ui.selectable_value(&mut self.processing.transform,name.into(),name);}});
+            ui.horizontal(|ui|{ui.label("Regex replace before transform");ui.text_edit_singleline(&mut self.processing.find);ui.label("with");ui.text_edit_singleline(&mut self.processing.replace);});
+        });
         let needed = self.sets_needed();
         self.sets.resize(needed, String::new());
         self.set = self.set.min(needed - 1);
@@ -966,8 +1023,8 @@ mod tests {
         let mut actions = Vec::new();
         let mut intruder = Intruder { target: target.clone(), template: format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", target.host_header()),
             attack: Attack::Null, repeat: 10, threads: 1, delay_ms: 60_000, grep: "token=1".into(), ..Default::default() };
-        intruder.start(&Env { rt: &tokio::runtime::Handle::current(), tx: &tx, egui: &egui::Context::default(),
-            shared: &shared, jar: &jar, actions: &mut actions });
+        intruder.start(&Env { listen_addr: "127.0.0.1:8080".parse().unwrap(), rt: &tokio::runtime::Handle::current(), tx: &tx, egui: &egui::Context::default(),
+            shared: &shared, jar: &jar, actions: &mut actions },false);
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 while let Ok(event) = rx.try_recv() {
@@ -999,3 +1056,7 @@ mod tests {
         assert_eq!(server.await.unwrap(), intruder.rows[0].req);
     }
 }
+
+#[cfg(test)]
+#[path="tests/intruder_workflows.rs"]
+mod workflow_regressions;

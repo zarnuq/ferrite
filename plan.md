@@ -183,6 +183,33 @@ Everything above is verified live or by tests, including the Crawler's GUI run.
   New HTML/header and Intruder behavior has automated coverage; its latest controls have not yet
   had a dedicated live GUI walkthrough. Repository-wide rustfmt differences remain pre-existing.
 
+### Chromium launcher and connectivity check (2026-10-17)
+
+- **Open Chromium** toolbar button launches `chromium` with the dedicated
+  `$HOME/.config/chromium-ferrite` profile, Ferrite's current listen address and
+  `--proxy-bypass-list=<-loopback>`. Wildcard listeners map to the corresponding
+  loopback address. Launch failures appear in the status bar; the child is reaped
+  without blocking the UI. The launcher now derives the CA's SHA-256 SPKI fingerprint
+  and passes `--ignore-certificate-errors-spki-list` so this browser accepts Ferrite's
+  generated HTTPS certificates automatically, without changing certificate stores.
+  Existing Chromium profile processes must fully exit before relaunching to apply flags.
+- **Compact navigation:** tools are in a grouped `View` dropdown, the launcher is a direct
+  `Open Chromium` button, and HTTP status filtering is a dropdown. Pending intercepted
+  requests retain a visible shortcut beside the current view.
+- **Window chrome:** native decorations are disabled. An egui title bar follows the app
+  theme and provides drag, double-click maximize/restore, minimize and close controls.
+- **HTTPS verification:** a temporary headless Chromium profile loaded `https://example.com/`
+  through the live Ferrite listener with the CA-specific exception; it rendered Example
+  Domain without a certificate-error page. Both browser tests and the release build passed.
+- **Connectivity:** direct HTTP to `10.129.71.210` returned 200 over `tun0`.
+  The original Ferrite listener timed out, then its process exited. Reopening
+  Ferrite restored access: both GET and HEAD through `127.0.0.1:8080` returned 200.
+  The original stall/exit cause was not established; no VPN or routing changes made.
+- **Validation:** 45 tests passed, 1 external-network test ignored; release build
+  and `git diff --check` passed. Launcher argument coverage includes profiles with
+  spaces, custom ports and IPv4/IPv6 wildcard binds. Running instances need reopening
+  to display the new button.
+
 ### Computer-switch handoff (2026-10-17)
 
 - **STOPPED / PAUSED:** user explicitly requested stopping feature work and making this handoff

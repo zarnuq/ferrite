@@ -2,8 +2,10 @@
 
 use crate::{
     Event,
-    http::{self, Msg, Target, Upstream},
+    http::{Msg, Target, Upstream},
 };
+#[cfg(test)]
+use crate::http;
 use eframe::egui;
 use hudsucker::futures::{StreamExt, stream};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -36,6 +38,15 @@ pub struct Issue {
     pub detail: String,
     pub req: Vec<u8>,
     pub res: Vec<u8>,
+}
+
+pub fn identity(issue:&Issue)->String {
+    let mut url=url::Url::parse(&issue.url).ok();
+    if let Some(url)=&mut url{url.set_query(None);url.set_fragment(None);}
+    let location=url.map_or_else(||issue.url.clone(),|u|u.to_string());
+    let method=Msg::parse(&issue.req).first.split_whitespace().next().unwrap_or("GET").to_string();
+    let point=issue.detail.split_once("Parameter '").or_else(||issue.detail.split_once("parameter '")).and_then(|(_,tail)|tail.split_once("'")).map(|(p,_)|p).unwrap_or(&issue.detail);
+    format!("{} {location} {method} {point}",issue.title)
 }
 
 pub struct Finding {
@@ -196,6 +207,8 @@ pub const ALL_TITLES: &[&str] = &[
     "SQL injection (time-based blind)",
     "OS command injection (time-based blind)",
     "Hidden parameter reflected",
+    "Custom scan check",
+    "Out-of-band interaction observed",
 ];
 
 // ---------- active scanning ----------
@@ -218,21 +231,37 @@ enum Point {
     Body(usize),
     Cookie(usize),
     Json(String),
+    Header(String),
+    Multipart(usize,usize),
 }
 
 fn cookie_pairs(m: &Msg) -> Vec<String> {
     m.header("cookie").unwrap_or("").split(';').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
 }
 
-fn json_object(m: &Msg) -> Option<serde_json::Map<String, serde_json::Value>> {
-    match serde_json::from_slice(&m.body).ok()? {
-        serde_json::Value::Object(o) => Some(o),
-        _ => None,
-    }
-}
-
 fn split_pairs(s: &str) -> Vec<&str> {
     s.split('&').filter(|p| !p.is_empty()).collect()
+}
+
+fn multipart_points(m:&Msg)->Vec<(Point,String)> {
+    let mut out=Vec::new();let content_type=m.header("content-type").unwrap_or("");
+    if !content_type.to_ascii_lowercase().starts_with("multipart/form-data"){return out;}
+    let boundary=content_type.split(';').filter_map(|p|p.trim().split_once('=')).find(|(k,_)|k.eq_ignore_ascii_case("boundary")).map(|(_,v)|v.trim_matches('"'));
+    let Some(boundary)=boundary.filter(|b|!b.is_empty()&&b.len()<=70&&!b.contains(['\r','\n']))else{return out;};
+    let delimiter=format!("--{boundary}");let delimiter=delimiter.as_bytes();
+    let starts:Vec<_>=m.body.windows(delimiter.len()).enumerate().filter(|(i,w)|*w==delimiter&&(*i==0||(*i>=2&&m.body.get(i-2..*i)==Some(b"\r\n")))&&matches!(m.body.get(i+delimiter.len()..i+delimiter.len()+2),Some(b"\r\n"|b"--"))).map(|(i,_)|i).collect();
+    for pair in starts.windows(2).take(200){
+        let start=pair[0]+delimiter.len()+2;let end=pair[1].saturating_sub(2);
+        let Some(part)=m.body.get(start..end)else{continue;};
+        let Some(split)=part.windows(4).position(|w|w==b"\r\n\r\n")else{continue;};
+        let head=String::from_utf8_lossy(&part[..split]);
+        let disposition=head.lines().find_map(|l|l.split_once(':').filter(|(k,_)|k.eq_ignore_ascii_case("content-disposition")).map(|(_,v)|v));
+        let Some(disposition)=disposition else{continue;};
+        if disposition.to_ascii_lowercase().contains("filename="){continue;}
+        let name=disposition.split(';').filter_map(|p|p.trim().split_once('=')).find(|(k,_)|k.eq_ignore_ascii_case("name")).map(|(_,v)|v.trim_matches('"'));
+        if let Some(name)=name{out.push((Point::Multipart(start+split+4,end),format!("multipart {name}")));}
+    }
+    out
 }
 
 fn points(m: &Msg) -> Vec<(Point, String)> {
@@ -248,16 +277,22 @@ fn points(m: &Msg) -> Vec<(Point, String)> {
             out.push((Point::Body(i), p.split('=').next().unwrap_or("").to_string()));
         }
     }
-    if let Some(obj) = json_object(m) {
-        for (k, v) in obj {
-            if v.is_string() || v.is_number() {
-                out.push((Point::Json(k.clone()), k));
-            }
+    fn json_points(value: &serde_json::Value, pointer: String, out: &mut Vec<(Point, String)>, depth: usize) {
+        if depth > 16 || out.len() >= 200 { return; }
+        match value {
+            serde_json::Value::Object(map) => for (key,value) in map { json_points(value, format!("{pointer}/{}",key.replace('~',"~0").replace('/',"~1")),out,depth+1); },
+            serde_json::Value::Array(array) => for (i,value) in array.iter().enumerate() { json_points(value,format!("{pointer}/{i}"),out,depth+1); },
+            serde_json::Value::String(_) | serde_json::Value::Number(_) => out.push((Point::Json(pointer.clone()),pointer)),
+            _ => {},
         }
     }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&m.body) { json_points(&value,String::new(),&mut out,0); }
     for (i, c) in cookie_pairs(m).iter().enumerate() {
         out.push((Point::Cookie(i), format!("cookie {}", c.split('=').next().unwrap_or(""))));
     }
+    out.extend(multipart_points(m));
+    for name in ["User-Agent","Referer","X-Forwarded-For"] {if m.header(name).is_some(){out.push((Point::Header(name.into()),format!("header {name}")));}}
+    out.truncate(200);
     out
 }
 
@@ -281,6 +316,8 @@ fn inject(m: &Msg, point: &Point, payload: &str, append: bool) -> Vec<u8> {
     };
     let mut m = Msg { first: m.first.clone(), headers: m.headers.clone(), body: m.body.clone() };
     match point {
+        Point::Header(name)=>{let prev=m.header(name).unwrap_or("");let value=set(prev,payload);if !value.contains(['\r','\n']){m.set_header(name,value);}},
+        Point::Multipart(start,end)=>{if *start<=*end&&*end<=m.body.len(){let prev=String::from_utf8_lossy(&m.body[*start..*end]);let value=set(&prev,payload);m.body.splice(*start..*end,value.bytes());}},
         Point::Query(i) => {
             let mut words: Vec<String> = m.first.split(' ').map(str::to_string).collect();
             if let Some((path, q)) = words.get(1).and_then(|t| t.split_once('?')).map(|(a, b)| (a.to_string(), b.to_string())) {
@@ -304,14 +341,12 @@ fn inject(m: &Msg, point: &Point, payload: &str, append: bool) -> Vec<u8> {
             m.set_header("Cookie", cookies.join("; "));
         }
         Point::Json(key) => {
-            if let Some(mut obj) = json_object(&m) {
-                let old = match obj.get(key) {
-                    Some(serde_json::Value::String(s)) => s.clone(),
-                    Some(v) => v.to_string(),
-                    None => String::new(),
-                };
-                obj.insert(key.clone(), serde_json::Value::String(set(&old, payload)));
-                m.body = serde_json::to_vec(&obj).unwrap_or(m.body);
+            if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&m.body) {
+                if let Some(old) = value.pointer_mut(key) {
+                    let prev = old.as_str().map(str::to_string).unwrap_or_else(|| old.to_string());
+                    *old = serde_json::Value::String(set(&prev,payload));
+                }
+                m.body = serde_json::to_vec(&value).unwrap_or_default();
             }
         }
     }
@@ -421,7 +456,12 @@ fn add_query(m: &Msg, name: &str, value: &str) -> Vec<u8> {
 }
 
 /// Probes every query and form parameter of one request, reporting issues as they are found.
+#[cfg(test)]
 pub async fn active(target: Target, raw: Vec<u8>, upstream: Upstream, tx: Sender<Event>, ui: egui::Context) {
+    active_controlled(target,raw,upstream,tx,ui,crate::session::Client::new(std::sync::Arc::default(),false,false),true,true).await
+}
+
+pub async fn active_controlled(target:Target,raw:Vec<u8>,upstream:Upstream,tx:Sender<Event>,ui:egui::Context,client:crate::session::Client,timing:bool,mining:bool) {
     let notify = |ev: Event| {
         let _ = tx.send(ev);
         ui.request_repaint();
@@ -430,58 +470,70 @@ pub async fn active(target: Target, raw: Vec<u8>, upstream: Upstream, tx: Sender
     let path = m.first.split_whitespace().nth(1).unwrap_or("/").to_string();
     let url = format!("{}{path}", target.url());
     let page = url.split('?').next().unwrap_or(&url).to_string();
-    let pts = points(&m);
+    let pts:Vec<_> = points(&m).into_iter().take(200).collect();
     if pts.is_empty() {
-        notify(Event::Status(format!("Active scan: no query or form parameters in {url}")));
+        notify(Event::Status(format!("Active scan: no supported insertion points in {url}")));
         return;
     }
-    let (baseline, base_time) = match http::send(&target, &raw, &upstream).await {
+    let (baseline, base_time) = match client.send(&target,&raw,&upstream).await.1 {
         Ok(r) => (String::from_utf8_lossy(&Msg::parse(&r.raw).decoded_body()).into_owned(), r.elapsed),
         Err(e) => {
             notify(Event::Status(format!("Active scan failed: {e}")));
             return;
         }
     };
-    let token = format!("fr{}", std::process::id() ^ (raw.len() as u32));
+    let token = format!("fr{}",crate::callbacks::token().unwrap_or_else(|_|crate::history::next_id().to_string()));
     let delay = std::time::Duration::from_secs(DELAY);
     // Each probe carries the request plus, for timing checks, a zero-delay control to confirm with.
-    let mut probes: Vec<(String, Check, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    let mut probes: Vec<(String, Check, Vec<u8>, Option<Vec<u8>>,Option<usize>)> = Vec::new();
     for (point, name) in &pts {
         for (check, payload, append) in payloads(&token) {
-            let timing = matches!(check, Check::SqlTime | Check::CmdTime);
+            let is_timing = matches!(check, Check::SqlTime | Check::CmdTime);
+            if is_timing && !timing {continue;}
             let req = inject(&m, point, &payload.replace("{T}", &DELAY.to_string()), append);
-            let control = timing.then(|| inject(&m, point, &payload.replace("{T}", "0"), append));
-            probes.push((name.clone(), check, req, control));
+            let control = Some(if is_timing { inject(&m, point, &payload.replace("{T}", "0"), append) } else { inject(&m, point, "ferritecontrol", false) });
+            probes.push((name.clone(), check, req, control,match point{Point::Cookie(index)=>Some(*index),_=>None}));
         }
     }
     let total = probes.len();
     let mut done = 0;
     let mut found = 0;
     let mut results = stream::iter(probes)
-        .map(|(name, check, req, control)| {
-            let (target, upstream) = (target.clone(), upstream.clone());
+        .map(|(name, check, req, control,cookie)| {
+            let (target, upstream, client) = (target.clone(), upstream.clone(),client.clone());
             async move {
-                let res = http::send(&target, &req, &upstream).await;
-                (name, check, req, control, res)
+                let (sent,res) = client.send_probe(&target,&req,&upstream,cookie).await;
+                (name, check, req, control,cookie,sent,res)
             }
         })
         .buffer_unordered(5);
-    while let Some((name, check, req, control, res)) = results.next().await {
+    while let Some((name, check, req, control,cookie,sent,res)) = results.next().await {
         done += 1;
         notify(Event::Status(format!("Active scan {url}: {done}/{total} probes, {found} issues")));
-        notify(Event::Log(crate::logger::entry("Scanner", &target, &req, &res)));
+        notify(Event::Log(crate::logger::entry("Scanner", &target, &sent, &res)));
         let Ok(r) = res else { continue };
         let hit = match control {
-            Some(control) => confirm_timing(check, &target, &upstream, &control, r.elapsed, base_time, delay, &name).await,
-            None => analyse(check, &token, &baseline, &Msg::parse(&r.raw), &name),
+            Some(control) if matches!(check,Check::SqlTime|Check::CmdTime) => confirm_timing(check, &target, &upstream, &client, &control,cookie, r.elapsed, base_time, delay, &name).await,
+            Some(control) => {
+                if let Some(mut hit)=analyse(check,&token,&baseline,&Msg::parse(&r.raw),&name){
+                    let neutral=client.send_probe(&target,&control,&upstream,cookie).await.1;
+                    let repeated=client.send_probe(&target,&req,&upstream,cookie).await.1;
+                    match (neutral,repeated){
+                        (Ok(neutral),Ok(repeated)) if analyse(check,&token,&baseline,&Msg::parse(&neutral.raw),&name).is_none() && analyse(check,&token,&baseline,&Msg::parse(&repeated.raw),&name).is_some()=>{hit.2.push_str(" Reproduced on a second probe; a neutral control did not match. Browser validation is required for reflected XSS.");Some(hit)},
+                        _=>None,
+                    }
+                }else{None}
+            },
+            None => None,
         };
         if let Some((severity, title, detail)) = hit {
             found += 1;
-            let issue = Issue { url: url.clone(), severity, title, detail, req, res: r.raw };
+            let issue = Issue { url: url.clone(), severity, title, detail, req:sent, res: r.raw };
             notify(Event::Issue(format!("active {title} {page} {name}"), issue));
         }
     }
 
+    if !mining {return;}
     // Param mining: try common parameter names not already present and see if any reflects.
     let existing: std::collections::HashSet<String> = pts.iter().map(|(_, n)| n.clone()).collect();
     let candidates: Vec<String> = PARAM_NAMES.iter().filter(|n| !existing.contains(**n)).map(|n| n.to_string()).collect();
@@ -495,9 +547,9 @@ pub async fn active(target: Target, raw: Vec<u8>, upstream: Upstream, tx: Sender
         .collect();
     let mut mine = stream::iter(requests)
         .map(|(name, tok, req)| {
-            let (target, upstream) = (target.clone(), upstream.clone());
+            let (target, upstream, client) = (target.clone(), upstream.clone(),client.clone());
             async move {
-                let res = http::send(&target, &req, &upstream).await;
+                let res = client.send(&target,&req,&upstream).await.1;
                 (name, tok, req, res)
             }
         })
@@ -530,7 +582,9 @@ async fn confirm_timing(
     check: Check,
     target: &Target,
     upstream: &Upstream,
+    client: &crate::session::Client,
     control: &[u8],
+    cookie:Option<usize>,
     probe_time: std::time::Duration,
     base_time: std::time::Duration,
     delay: std::time::Duration,
@@ -539,7 +593,7 @@ async fn confirm_timing(
     if probe_time < base_time + delay.mul_f32(0.9) {
         return None;
     }
-    let control_fast = http::send(target, control, upstream).await.is_ok_and(|c| c.elapsed < base_time + delay / 2);
+    let control_fast = client.send_probe(target, control, upstream,cookie).await.1.is_ok_and(|c| c.elapsed < base_time + delay / 2);
     if !control_fast {
         return None;
     }
@@ -582,9 +636,9 @@ mod tests {
         // JSON body fields and cookie values are injectable points too.
         let j = Msg::parse(b"POST /p HTTP/1.1\r\nContent-Type: application/json\r\nCookie: sid=1; csrf=x\r\nContent-Length: 17\r\n\r\n{\"u\":\"a\",\"n\":2}");
         let names: Vec<String> = points(&j).into_iter().map(|(_, n)| n).collect();
-        assert!(names.contains(&"u".to_string()) && names.contains(&"n".to_string()));
+        assert!(names.contains(&"/u".to_string()) && names.contains(&"/n".to_string()));
         assert!(names.iter().any(|n| n.contains("sid")) && names.iter().any(|n| n.contains("csrf")));
-        let got = inject(&j, &Point::Json("u".into()), "X", true);
+        let got = inject(&j, &Point::Json("/u".into()), "X", true);
         assert!(got.windows(8).any(|w| w == b"\"u\":\"aX\""), "{}", String::from_utf8_lossy(&got));
         assert_eq!(
             inject(&m, &Point::Query(1), "'", true),
@@ -673,3 +727,36 @@ mod active_tests {
         assert!(!issues.iter().any(|(u, _)| u.contains("/safe")), "false positive: {issues:?}");
     }
 }
+
+
+/// Opt-in blind SSRF/XXE probes using the user's reachable callback endpoint.
+pub async fn oast(target: Target, raw: Vec<u8>, base: String, client: crate::session::Client, upstream: Upstream, tx: Sender<Event>, ui: egui::Context) {
+    let Ok(callback) = url::Url::parse(&base.replace("{{token}}","probe")) else {let _=tx.send(Event::Status("Scanner callback base must be an HTTP(S) URL".into()));return;};
+    if !matches!(callback.scheme(),"http"|"https") || callback.host_str().is_none() {return;}
+    let msg = Msg::parse(&raw);
+    let path=msg.first.split_whitespace().nth(1).unwrap_or("/");
+    let url=format!("{}{path}",target.url());
+    let mut probes=Vec::new();
+    for(point,_)in points(&msg).into_iter().take(20) {
+        let Ok(token)=crate::callbacks::token()else{return;};
+        let payload=crate::callbacks::payload(&base,&token);
+        probes.push((token,"SSRF",inject(&msg,&point,&payload,false)));
+    }
+    if msg.header("content-type").is_some_and(|t|t.contains("xml")) {
+        if let Ok(token)=crate::callbacks::token(){
+            let mut xml=Msg::parse(&raw);
+            let callback=crate::callbacks::payload(&base,&token).replace('&',"&amp;").replace('"',"&quot;");
+            xml.body=format!("<!DOCTYPE ferrite [<!ENTITY probe SYSTEM \"{callback}\">]><ferrite>&probe;</ferrite>").into_bytes();xml.set_header("Content-Length",xml.body.len().to_string());
+            probes.push((token,"XXE",xml.render()));
+        }
+    }
+    for(token,kind,request)in probes {
+        let _=tx.send(Event::OastProbe(crate::callbacks::Probe{token,url:url.clone(),request:crate::retention::clip(request.clone()),kind:kind.into()}));
+        let(sent,result)=client.send(&target,&request,&upstream).await;
+        let _=tx.send(Event::Log(crate::logger::entry("Scanner",&target,&sent,&result)));ui.request_repaint();
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/scanner_regression.rs"]
+mod robust_scanner_tests;

@@ -125,6 +125,7 @@ impl Default for History {
 
 impl History {
     pub fn on_request(&mut self, id: u64, url: String, raw: Vec<u8>) {
+        let raw = crate::retention::clip(raw);
         let m = Msg::parse(&raw);
         let mut words = m.first.split_whitespace();
         let method = words.next().unwrap_or_default().to_string();
@@ -151,6 +152,7 @@ impl History {
     }
 
     pub fn on_response(&mut self, id: u64, raw: Vec<u8>, ms: u128) {
+        let raw = crate::retention::clip(raw);
         let Some(f) = self.index.get(&id).and_then(|&i| self.flows.get_mut(i)) else {
             return;
         };
@@ -198,13 +200,40 @@ impl History {
 
     /// Records an issue unless one with the same key exists.
     pub fn add_issue(&mut self, key: String, issue: Issue) {
+        if self.issues.iter().any(|old| crate::scanner::identity(old)==crate::scanner::identity(&issue)){return;}
         if self.issue_keys.insert(key) {
             self.issues.push(issue);
         }
     }
 
+    pub fn enforce_limits(&mut self) {
+        use crate::retention::{ROWS, BYTES};
+        let mut bytes: usize = self.flows.iter().map(|f| f.req.len() + f.res.as_ref().map_or(0, Vec::len)).sum();
+        let mut remove = 0;
+        while self.flows.len() - remove > ROWS || bytes > BYTES {
+            let Some(f) = self.flows.get(remove) else { break };
+            bytes -= f.req.len() + f.res.as_ref().map_or(0, Vec::len);
+            remove += 1;
+        }
+        if remove > 0 {
+            self.flows.drain(..remove);
+            self.index = self.flows.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+            self.dirty = true;
+            self.generation += 1;
+        }
+        let mut bytes = 0;
+        let keep = self.ws.iter().rev().take(ROWS).take_while(|m| { bytes += m.data.len(); bytes <= BYTES / 4 }).count();
+        self.ws.drain(..self.ws.len() - keep);
+        let mut bytes = 0;
+        let keep = self.issues.iter().rev().take(2000).take_while(|i| { bytes += i.req.len() + i.res.len(); bytes <= BYTES }).count();
+        if self.issues.len() > keep {
+            self.issues.drain(..self.issues.len() - keep);
+            self.issue_keys = self.issues.iter().map(|i| format!("{} {}", i.title, i.url)).collect();
+        }
+    }
+
     pub fn on_ws(&mut self, url: String, outgoing: bool, text: bool, data: Vec<u8>) {
-        self.ws.push(WsMsg { url, outgoing, text, data });
+        self.ws.push(WsMsg { url, outgoing, text, data: crate::retention::clip(data) });
     }
 
     // ponytail: refilters every flow on each change, O(n) regex over bodies; incremental filter if history gets huge
@@ -260,6 +289,7 @@ impl History {
             ui.selectable_value(&mut self.show_ws, true, format!("WebSockets history ({})", self.ws.len()));
             ui.separator();
             if !self.show_ws {
+                ui.label("ⓘ").on_hover_text("History retains up to 10,000 flows / 64 MiB; evidence is capped at 1 MiB per message. Save important exchanges to Organizer.");
                 let search = egui::TextEdit::singleline(&mut self.search).hint_text("Search").desired_width(220.0);
                 let search = if self.search_error { search.text_color(Color32::RED) } else { search };
                 let changed = ui.add(search).changed()
@@ -267,13 +297,16 @@ impl History {
                     | ui.checkbox(&mut self.scope_only, "In-scope only").changed()
                     | ui.checkbox(&mut self.hide_static, "Hide images/CSS/fonts").changed();
                 ui.separator();
-                ui.label("Status");
-                for (cls, label) in [(0u8, "All"), (2, "2xx"), (3, "3xx"), (4, "4xx"), (5, "5xx")] {
-                    if ui.selectable_label(self.status_class == cls, label).clicked() {
-                        self.status_class = cls;
-                        self.dirty = true;
-                    }
-                }
+                let statuses = [(0u8, "All"), (2, "2xx"), (3, "3xx"), (4, "4xx"), (5, "5xx")];
+                let selected = statuses.iter().find(|(cls, _)| *cls == self.status_class).map_or("All", |(_, label)| *label);
+                egui::ComboBox::from_id_salt("history_status")
+                    .selected_text(format!("Status: {selected}"))
+                    .width(100.0)
+                    .show_ui(ui, |ui| {
+                        for (cls, label) in statuses {
+                            self.dirty |= ui.selectable_value(&mut self.status_class, cls, label).changed();
+                        }
+                    });
                 self.dirty |= changed;
             }
             if ui.button("Clear").clicked() {

@@ -468,6 +468,7 @@ pub struct Target {
 impl Target {
     pub fn from_url(url: &str) -> Option<Target> {
         let uri: hudsucker::hyper::Uri = url.parse().ok()?;
+        if !matches!(uri.scheme_str(), Some("http" | "https" | "ws" | "wss")) { return None; }
         let tls = uri.scheme_str() == Some("https") || uri.scheme_str() == Some("wss");
         Some(Target {
             host: uri.host()?.trim_matches(['[', ']']).to_string(),
@@ -600,7 +601,7 @@ pub fn insecure_tls() -> ClientConfig {
         .with_no_client_auth()
 }
 
-trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
 pub struct Reply {
@@ -613,15 +614,7 @@ pub struct Reply {
 pub async fn send(target: &Target, raw: &[u8], upstream: &Upstream) -> Result<Reply, String> {
     let start = Instant::now();
     let work = async {
-        let tcp = dial(&target.host, target.port, upstream).await?;
-        let mut stream: Box<dyn Stream> = if target.tls {
-            let mut cfg = insecure_tls();
-            cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-            let name = ServerName::try_from(target.host.clone()).map_err(io::Error::other)?;
-            Box::new(tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await?)
-        } else {
-            Box::new(tcp)
-        };
+        let mut stream = connect(target, upstream).await?;
         stream.write_all(raw).await?;
         let head_only = raw.starts_with(b"HEAD ");
         read_response(&mut stream, head_only).await
@@ -633,12 +626,26 @@ pub async fn send(target: &Target, raw: &[u8], upstream: &Upstream) -> Result<Re
     Ok(Reply { status: Msg::parse(&raw).status(), raw, elapsed: start.elapsed() })
 }
 
+pub(crate) async fn connect(target: &Target, upstream: &Upstream) -> io::Result<Box<dyn Stream>> {
+        let tcp = dial(&target.host, target.port, upstream).await?;
+        let stream: Box<dyn Stream> = if target.tls {
+            let mut cfg = insecure_tls();
+            cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let name = ServerName::try_from(target.host.clone()).map_err(io::Error::other)?;
+            Box::new(tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await?)
+        } else {
+            Box::new(tcp)
+        };
+        Ok(stream)
+}
+
 /// Reads one HTTP/1.x response, using Content-Length, chunked framing or EOF.
-async fn read_response(stream: &mut Box<dyn Stream>, head_only: bool) -> io::Result<Vec<u8>> {
+pub(crate) async fn read_response(stream: &mut Box<dyn Stream>, head_only: bool) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     let mut read_more = async |buf: &mut Vec<u8>| -> io::Result<bool> {
         let n = stream.read(&mut chunk).await?;
+        if buf.len() + n > 16 * 1024 * 1024 { return Err(io::Error::other("response exceeds 16 MiB tool limit")); }
         buf.extend_from_slice(&chunk[..n]);
         Ok(n > 0)
     };
@@ -674,6 +681,9 @@ async fn read_response(stream: &mut Box<dyn Stream>, head_only: bool) -> io::Res
                 }
             }
             if !read_more(&mut buf).await? {
+                if chunked || length.is_some_and(|len| buf.len() < head_end + len) {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete HTTP response body"));
+                }
                 return Ok(buf);
             }
         }
@@ -809,4 +819,13 @@ mod live {
         let r = send(&t, b"GET / HTTP/1.1\r\nHost: self-signed.badssl.com\r\nConnection: close\r\n\r\n", &Upstream::None).await.unwrap();
         assert_eq!(r.status, 200);
     }
+}
+
+pub type WsStream = hudsucker::tokio_tungstenite::WebSocketStream<hudsucker::tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+pub async fn websocket(request: hudsucker::hyper::Request<()>, upstream: &Upstream) -> Result<(WsStream, hudsucker::tokio_tungstenite::tungstenite::handshake::client::Response), String> {
+    let uri = request.uri();
+    let host = uri.host().ok_or("WebSocket URL has no host")?.trim_matches(['[',']']);
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") {443}else{80});
+    let tcp = dial(host,port,upstream).await.map_err(|e|e.to_string())?;
+    hudsucker::tokio_tungstenite::client_async_tls_with_config(request,tcp,None,Some(hudsucker::tokio_tungstenite::Connector::Rustls(Arc::new(insecure_tls())))).await.map_err(|e|e.to_string())
 }

@@ -6,7 +6,7 @@ use std::{sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
 pub type Shared = Arc<Mutex<Jar>>;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Cookie {
     host: String,
     path: String,
@@ -17,15 +17,37 @@ struct Cookie {
     expires: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Jar { cookies: Vec<Cookie> }
 
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 
 impl Jar {
+    pub fn is_empty(&self)->bool{self.cookies.is_empty()}
+    pub fn restore(&mut self, saved: Self) {
+        self.cookies.clear();
+        for cookie in saved.cookies.into_iter().take(2000) {
+            if cookie.value.contains(';') || [&cookie.name,&cookie.value,&cookie.host,&cookie.path].iter().any(|s|s.bytes().any(|b|b<0x20||b==0x7f)){continue;}
+            let authority = if cookie.host.contains(':') { format!("[{}]",cookie.host) } else { cookie.host.clone() };
+            let source = format!("{}://{authority}{}",if cookie.secure {"https"} else {"http"},cookie.path);
+            let header = format!("{}={}; Path={}{}{}",cookie.name,cookie.value,cookie.path,if cookie.secure {"; Secure"} else {""},if cookie.http_only {"; HttpOnly"} else {""});
+            if self.set_cookie(&source,&header).is_ok() {
+                if let Some(c) = self.cookies.iter_mut().find(|c| c.host==cookie.host && c.path==cookie.path && c.name==cookie.name) { c.expires=cookie.expires; }
+            }
+        }
+        self.prune();
+    }
+
+    pub fn browser_cookies(&mut self, source: &str) -> Vec<serde_json::Value> {
+        self.prune();
+        let Some(target) = Target::from_url(source) else { return Vec::new() };
+        self.cookies.iter().filter(|c| c.host == target.host && (!c.secure || target.tls)).map(|c| serde_json::json!({"name":c.name,"value":c.value,"url":target.url(),"path":c.path,"secure":c.secure,"httpOnly":c.http_only})).collect()
+    }
+
     fn prune(&mut self) { let t = now(); self.cookies.retain(|c| c.expires.is_none_or(|e| e > t)); }
 
     pub fn set_cookie(&mut self, url: &str, header: &str) -> Result<(), String> {
+        if header.bytes().any(|b|b<0x20||b==0x7f){return Err("Cookie header contains control characters".into());}
         let url = url::Url::parse(url).map_err(|e| e.to_string())?;
         if !matches!(url.scheme(), "http" | "https") { return Err("Use an HTTP(S) URL".into()); }
         let host = url.host_str().ok_or("URL has no host")?.trim_matches(['[', ']']).to_ascii_lowercase();
@@ -95,10 +117,12 @@ fn path_matches(cookie: &str, request: &str) -> bool {
 }
 
 #[derive(Clone)]
-pub struct Client { jar: Shared, reuse: bool, capture: bool }
+pub struct Client { jar: Shared, reuse: bool, capture: bool, macros: Vec<crate::macros::Macro>, work: Option<crate::work::Work> }
 
 impl Client {
-    pub fn new(jar: Shared, reuse: bool, capture: bool) -> Self { Self { jar, reuse, capture } }
+    pub fn new(jar: Shared, reuse: bool, capture: bool) -> Self { Self { jar, reuse, capture, macros: Vec::new(), work:None } }
+    pub fn with_work(mut self, work: crate::work::Work) -> Self { self.work=Some(work); self }
+    pub fn with_macros(mut self, macros: Vec<crate::macros::Macro>) -> Self { self.macros = macros; self }
     pub fn prepare(&self, target: &Target, request: &[u8]) -> Vec<u8> {
         if self.reuse { self.jar.lock().unwrap().apply(target, request) } else { request.to_vec() }
     }
@@ -109,9 +133,29 @@ impl Client {
             self.jar.lock().unwrap().capture(&format!("{}{path}", target.url()), &reply.raw);
         }
     }
-    pub async fn send(&self, target: &Target, request: &[u8], upstream: &Upstream) -> (Vec<u8>, Result<Reply, String>) {
-        let sent = self.prepare(target, request);
-        let result = http::send(target, &sent, upstream).await;
+    pub async fn send(&self, target:&Target,request:&[u8],upstream:&Upstream)->(Vec<u8>,Result<Reply,String>){self.send_protocol(target,request,upstream,false).await}
+    pub async fn send_protocol(&self,target:&Target,request:&[u8],upstream:&Upstream,http2:bool)->(Vec<u8>,Result<Reply,String>){self.send_mode(target,request,upstream,http2,None).await}
+    pub async fn send_probe(&self,target:&Target,request:&[u8],upstream:&Upstream,cookie:Option<usize>)->(Vec<u8>,Result<Reply,String>){self.send_mode(target,request,upstream,false,cookie).await}
+    async fn send_mode(&self, target: &Target, request: &[u8], upstream: &Upstream, http2:bool, cookie:Option<usize>) -> (Vec<u8>, Result<Reply, String>) {
+        let _permit = if let Some(work)=&self.work { match work.begin().await { Ok(permit)=>Some(permit),Err(e)=>return(request.to_vec(),Err(e)) } }else{None};
+        let _guard = if self.macros.iter().any(|m| m.enabled && m.origin.trim_end_matches('/') == target.url()) {
+            Some(crate::macros::GATE.clone().lock_owned().await)
+        } else { None };
+        let mut sent = match crate::macros::prepare(&self.macros, self, target, request, upstream).await { Ok(sent) => sent, Err(e) => { let result=Err(e); if let Some(work)=&self.work{work.finish(&result);} return (request.to_vec(),result); } };
+        // Keep the selected scanner insertion point after session refresh, while
+        // allowing the jar to refresh all other cookies and macro credentials.
+        if let Some(index)=cookie {
+            let original=Msg::parse(request);
+            if let Some(pair)=original.header("cookie").and_then(|v|v.split(';').map(str::trim).filter(|v|!v.is_empty()).nth(index)) {
+                if let Some((name,_))=pair.split_once('='){
+                    let mut message=Msg::parse(&sent);let mut replaced=false;
+                    let mut pairs:Vec<_>=message.header("cookie").into_iter().flat_map(|v|v.split(';')).map(str::trim).filter(|v|!v.is_empty()).map(|value|{if !replaced&&value.split_once('=').is_some_and(|(key,_)|key==name){replaced=true;pair.to_string()}else{value.to_string()}}).collect();
+                    if !replaced{pairs.push(pair.to_string());}message.set_header("Cookie",pairs.join("; "));sent=message.render();
+                }
+            }
+        }
+        let result = if http2 {crate::groups::send(target.clone(),vec![sent.clone()],upstream.clone(),crate::groups::Mode::Http2).await.into_iter().next().map(|(_,r)|r).unwrap_or_else(||Err("HTTP/2 returned no result".into()))}else{http::send(target, &sent, upstream).await};
+        if let Some(work)=&self.work {work.finish(&result);}
         self.capture(target, &sent, &result);
         (sent, result)
     }
@@ -123,16 +167,20 @@ pub struct Sessions {
     header: String,
     message: String,
     search: String,
+    macros: crate::macros::Editor,
 }
 impl Default for Sessions {
-    fn default() -> Self { Self { jar: Arc::default(), url: "https://example.com/".into(), header: String::new(), message: String::new(), search: String::new() } }
+    fn default() -> Self { Self { jar: Arc::default(), url: "https://example.com/".into(), header: String::new(), message: String::new(), search: String::new(), macros: Default::default() } }
 }
 impl Sessions {
-    pub fn ui(&mut self, ui: &mut egui::Ui, capture: &mut bool) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, cfg: &mut crate::rules::Config) {
+        crate::authz::identity_editor(ui, &mut cfg.identities, &self.jar);
+        self.macros.ui(ui, &mut cfg.session_macros);
+        let capture = &mut cfg.capture_cookies;
         ui.heading("Session cookie jar");
         ui.checkbox(capture, "Capture Set-Cookie from proxy and tool responses");
         ui.label("Enable Use session cookies in Repeater, Intruder, Crawler or Discovery to reuse captured cookies.");
-        ui.weak("Cookies stay in memory and are bound to their source host. Path, Secure and expiration are respected; Domain does not expand delivery to subdomains.");
+        ui.weak("Cookies are saved with this project and are bound to their source host. Path, Secure and expiration are respected; Domain does not expand delivery to subdomains.");
         ui.horizontal(|ui| {
             ui.label("URL"); ui.add(egui::TextEdit::singleline(&mut self.url).desired_width(300.0));
             ui.label("Set-Cookie"); ui.add(egui::TextEdit::singleline(&mut self.header).hint_text("sid=value; Path=/; Secure").desired_width(350.0));

@@ -37,6 +37,7 @@ fn key_path(url: &str, path: &str) -> Option<Vec<String>> {
 pub struct TargetTab {
     show_issues: bool,
     scope_only: bool,
+    scope: Option<std::sync::Arc<rules::Compiled>>,
     tree: Option<(u64, bool, Node)>,
     node: Vec<String>,
     node_flows: Option<(u64, Vec<String>, Vec<usize>)>,
@@ -53,6 +54,7 @@ impl Default for TargetTab {
         TargetTab {
             show_issues: false,
             scope_only: false,
+            scope: None,
             tree: None,
             node: Vec::new(),
             node_flows: None,
@@ -73,28 +75,44 @@ fn show_node(
     path: &mut Vec<String>,
     selected: &[String],
     clicked: &mut Option<Vec<String>>,
+    env: &mut Env,
 ) {
     path.push(name.to_string());
     let is_selected = selected == path.as_slice();
     if node.children.is_empty() {
-        if ui.selectable_label(is_selected, name).clicked() {
+        let response = ui.selectable_label(is_selected, name);
+        if response.clicked() || response.secondary_clicked() {
             *clicked = Some(path.clone());
         }
+        response.context_menu(|ui| host_scope_menu(ui, env, &path[0]));
     } else {
         let id = ui.make_persistent_id(path.join("\u{0}"));
         CollapsingState::load_with_default_open(ui.ctx(), id, false)
             .show_header(ui, |ui| {
-                if ui.selectable_label(is_selected, name).clicked() {
+                let response = ui.selectable_label(is_selected, name);
+                if response.clicked() || response.secondary_clicked() {
                     *clicked = Some(path.clone());
                 }
+                response.context_menu(|ui| host_scope_menu(ui, env, &path[0]));
             })
             .body(|ui| {
                 for (k, child) in &node.children {
-                    show_node(ui, k, child, path, selected, clicked);
+                    show_node(ui, k, child, path, selected, clicked, env);
                 }
             });
     }
     path.pop();
+}
+
+fn host_scope_menu(ui: &mut egui::Ui, env: &mut Env, origin: &str) {
+    if ui.button("Add host to scope").clicked() {
+        env.actions.push(crate::Action::AddScope(origin.to_string()));
+        ui.close();
+    }
+    if ui.button("Copy origin").clicked() {
+        ui.ctx().copy_text(origin.to_string());
+        ui.close();
+    }
 }
 
 impl TargetTab {
@@ -125,7 +143,9 @@ impl TargetTab {
         }
 
         let scope = rules::current(env.shared);
-        if self.tree.as_ref().is_none_or(|(g, s, _)| *g != history.generation || *s != self.scope_only) {
+        if self.tree.as_ref().is_none_or(|(g, s, _)| *g != history.generation || *s != self.scope_only)
+            || self.scope.as_ref().is_none_or(|old| !std::sync::Arc::ptr_eq(old, &scope))
+        {
             let mut root = Node::default();
             for f in &history.flows {
                 if self.scope_only && !scope.in_scope(&f.url) {
@@ -139,6 +159,8 @@ impl TargetTab {
                 }
             }
             self.tree = Some((history.generation, self.scope_only, root));
+            self.scope = Some(scope.clone());
+            self.node_flows = None;
         }
 
         let mut clicked = None;
@@ -150,7 +172,7 @@ impl TargetTab {
                 }
                 let mut path = Vec::new();
                 for (k, child) in &root.children {
-                    show_node(ui, k, child, &mut path, &self.node, &mut clicked);
+                    show_node(ui, k, child, &mut path, &self.node, &mut clicked, env);
                 }
             });
         });
@@ -165,7 +187,8 @@ impl TargetTab {
                 .flows
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| key_path(&f.url, &f.path).is_some_and(|k| !self.node.is_empty() && k.starts_with(&self.node)))
+                .filter(|(_, f)| (!self.scope_only || scope.in_scope(&f.url))
+                    && key_path(&f.url, &f.path).is_some_and(|k| !self.node.is_empty() && k.starts_with(&self.node)))
                 .map(|(i, _)| i)
                 .collect();
             self.node_flows = Some((history.generation, self.node.clone(), list));
@@ -309,3 +332,7 @@ mod tests {
         assert_eq!(key_path("https://a.com/?q", "/?q").unwrap(), ["https://a.com", "/?q"]);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/target_scope_regression.rs"]
+mod robust_scope_tests;

@@ -1,5 +1,5 @@
 //! Save and load a session to a `.ferrite` file: gzipped JSON of history, WebSocket
-//! messages and scanner issues. Not a live Burp project (no incremental autosave).
+//! messages and scanner issues, with atomic background recovery snapshots.
 
 use crate::{
     history::{Flow, History, WsMsg},
@@ -10,6 +10,15 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use base64::Engine;
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Context {
+    pub settings: crate::rules::Config,
+    pub cookies: crate::session::Jar,
+    pub reviews: crate::reports::Saved,
+    pub scans: Vec<crate::dashboard::SavedJob>,
+}
 
 const MAGIC: &str = "ferrite-project-v1";
 
@@ -51,7 +60,9 @@ struct SavedIssue {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Project {
+pub struct Project {
+    #[serde(default)]
+    context: Option<Context>,
     magic: String,
     flows: Vec<SavedFlow>,
     ws: Vec<SavedWs>,
@@ -75,8 +86,14 @@ fn intern(title: &str) -> &'static str {
     Box::leak(title.to_string().into_boxed_str())
 }
 
+#[cfg(test)]
 pub fn save(history: &History, repeater: &crate::repeater::Repeater, organizer: &crate::organizer::Organizer, intruder: &crate::intruder::Intruder, path: &str) -> Result<(), String> {
-    let project = Project {
+    write_snapshot(snapshot(history, repeater, organizer, intruder), path)
+}
+
+pub fn snapshot(history: &History, repeater: &crate::repeater::Repeater, organizer: &crate::organizer::Organizer, intruder: &crate::intruder::Intruder) -> Project {
+    Project {
+        context: None,
         magic: MAGIC.to_string(),
         repeater: repeater.save_state(),
         organizer: organizer.saved().clone(),
@@ -113,15 +130,41 @@ pub fn save(history: &History, repeater: &crate::repeater::Repeater, organizer: 
                 res: i.res.clone(),
             })
             .collect(),
-    };
+    }
+}
+
+impl Project { pub fn with_context(mut self, context: Context) -> Self { self.context=Some(context); self } }
+pub fn write_snapshot(project: Project, path: &str) -> Result<(), String> { write_snapshot_ref(&project,path) }
+pub fn write_snapshot_ref(project: &Project, path: &str) -> Result<(), String> {
     let json = serde_json::to_vec(&project).map_err(|e| e.to_string())?;
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
     gz.write_all(&json).map_err(|e| e.to_string())?;
     let bytes = gz.finish().map_err(|e| e.to_string())?;
-    std::fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))
+    atomic_write(std::path::Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))
 }
 
+/// Same-directory rename keeps the previous snapshot intact on failed writes.
+pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".ferrite-{}-{}.tmp", std::process::id(), crate::history::next_id()));
+    let result = (|| {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(tmp); }
+    result
+}
+
+#[cfg(test)]
 pub fn load(history: &mut History, repeater: &mut crate::repeater::Repeater, organizer: &mut crate::organizer::Organizer, intruder: &mut crate::intruder::Intruder, path: &str) -> Result<usize, String> {
+    load_with_context(history,repeater,organizer,intruder,path).map(|(n,_)|n)
+}
+pub fn load_with_context(history: &mut History, repeater: &mut crate::repeater::Repeater, organizer: &mut crate::organizer::Organizer, intruder: &mut crate::intruder::Intruder, path: &str) -> Result<(usize, Option<Context>), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     let mut json = Vec::new();
     GzDecoder::new(&bytes[..]).read_to_end(&mut json).map_err(|_| "not a gzipped ferrite project".to_string())?;
@@ -158,7 +201,7 @@ pub fn load(history: &mut History, repeater: &mut crate::repeater::Repeater, org
     repeater.restore(project.repeater);
     intruder.restore(project.intruder);
     organizer.restore(project.organizer);
-    Ok(count)
+    Ok((count,project.context))
 }
 
 

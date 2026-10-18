@@ -5,9 +5,9 @@ use crate::{Env, Event, http};
 use eframe::egui::{self, Color32};
 use hudsucker::{
     futures::{SinkExt, StreamExt},
-    tokio_tungstenite::{Connector, connect_async_tls_with_config, tungstenite::Message},
+    tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest},
 };
-use std::sync::Arc;
+
 use tokio::sync::mpsc;
 
 /// What the UI tells the live connection task to do.
@@ -62,6 +62,8 @@ impl Default for WsRepeater {
 }
 
 impl WsRepeater {
+    pub fn reset_project(&mut self){if let Some(tx)=self.tx.take(){let _=tx.send(Cmd::Close);}self.run+=1;self.connected=false;self.log.clear();}
+
     /// Seeds the URL from a WebSocket flow sent here.
     pub fn load(&mut self, url: String) {
         self.url = url;
@@ -112,10 +114,10 @@ impl WsRepeater {
             let _ = ev_tx.send(Event::WsRepeater { run, note: n });
             ui.request_repaint();
         };
-        // ponytail: ignores the upstream proxy; route through it if WS-over-proxy is needed
+        let upstream = env.upstream();
         env.rt.spawn(async move {
-            let connector = Connector::Rustls(Arc::new(http::insecure_tls()));
-            let stream = match connect_async_tls_with_config(&url, None, false, Some(connector)).await {
+            let request = match url.into_client_request() { Ok(r) => r, Err(e) => return notify(Note::Error(e.to_string())) };
+            let stream = match http::websocket(request, &upstream).await {
                 Ok((s, _)) => s,
                 Err(e) => return notify(Note::Error(e.to_string())),
             };

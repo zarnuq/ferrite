@@ -100,7 +100,11 @@ pub async fn run(
     tx: Sender<Event>,
     ui: egui::Context,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let ca = RcgenAuthority::new(load_or_create_ca()?, 1_000, aws_lc_rs::default_provider());
+    run_with_issuer(addr, shared, tx, ui, load_or_create_ca()?).await
+}
+
+pub(crate) async fn run_with_issuer(addr: SocketAddr, shared: Shared, tx: Sender<Event>, ui: egui::Context, issuer: Issuer<'static, KeyPair>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let ca = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(http::insecure_tls())
         .https_or_http()
@@ -108,7 +112,6 @@ pub async fn run(
         .enable_http2()
         .wrap_connector(Dialer(shared.clone()));
     let handler = Handler { shared, tx, ui, id: 0, url: String::new(), start: Instant::now(), record: true };
-    // ponytail: websocket upgrades connect directly, ignoring the upstream proxy; custom tungstenite connect if needed
     Proxy::builder()
         .with_addr(addr)
         .with_ca(ca)
@@ -147,11 +150,67 @@ impl Handler {
         rx.await.unwrap_or(Some(raw))
     }
 
+    async fn websocket(&self, mut request: Request<Body>, _peer: SocketAddr) -> Response<Body> {
+        use hudsucker::futures::{SinkExt, StreamExt};
+        let mut uri = request.uri().clone().into_parts();
+        uri.scheme = Some(if request.uri().scheme_str() == Some("https") { "wss" } else { "ws" }.parse().unwrap());
+        let uri = match Uri::from_parts(uri) { Ok(uri) => uri, Err(e) => return self.respond(StatusCode::BAD_REQUEST,e.to_string()) };
+        let mut upstream_request = Request::builder().method("GET").uri(uri.clone()).body(()).unwrap();
+        *upstream_request.headers_mut() = request.headers().clone();
+        let upstream = current(&self.shared).cfg.upstream.clone();
+        let (server, handshake) = match tokio::time::timeout(std::time::Duration::from_secs(30),http::websocket(upstream_request,&upstream)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return self.respond(StatusCode::BAD_GATEWAY,e),
+            Err(_) => return self.respond(StatusCode::GATEWAY_TIMEOUT,"WebSocket connection timed out".into()),
+        };
+        let (mut response, upgrade) = match hyper_tungstenite::upgrade(&mut request,None) {
+            Ok(result) => result, Err(e) => return self.respond(StatusCode::BAD_REQUEST,e.to_string()),
+        };
+        if let Some(protocol) = handshake.headers().get("sec-websocket-protocol") {
+            response.headers_mut().insert("sec-websocket-protocol",protocol.clone());
+        }
+        let handler = self.clone();
+        tokio::spawn(async move {
+            let Ok(client) = upgrade.await else { return };
+            let (mut to_client, mut from_client) = client.split();
+            let (mut to_server, mut from_server) = server.split();
+            let mut outgoing = handler.clone(); let mut incoming = handler;
+            let out_url = uri.to_string();
+            let in_url = uri.to_string();
+            let out = async {
+                while let Some(Ok(message)) = from_client.next().await {
+                    if let Some(message) = outgoing.websocket_message(out_url.clone(),true,message).await {
+                        if to_server.send(message).await.is_err() {break;}
+                    }
+                }
+            };
+            let input = async {
+                while let Some(Ok(message)) = from_server.next().await {
+                    if let Some(message) = incoming.websocket_message(in_url.clone(),false,message).await {
+                        if to_client.send(message).await.is_err() {break;}
+                    }
+                }
+            };
+            tokio::select! { _=out=>{}, _=input=>{} }
+        });
+        response.map(Body::from)
+    }
+
     fn respond(&self, status: StatusCode, note: String) -> Response<Body> {
         let raw = format!("HTTP/1.1 {status}\r\nContent-Type: text/plain\r\n\r\n{note}").into_bytes();
         self.send(Event::Response { id: self.id, raw, ms: self.start.elapsed().as_millis() });
         Response::builder().status(status).body(Body::from(note)).unwrap()
     }
+}
+
+fn captured_response(head: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut msg = Msg::parse(head);
+    msg.headers.retain(|(k,_)| !k.eq_ignore_ascii_case("transfer-encoding"));
+    msg.set_header("Content-Length",body.len().to_string());
+    if body.len() >= crate::retention::MESSAGE {
+        msg.set_header("X-Ferrite-Capture", "retained body capped at 1 MiB; forwarded body is complete".into());
+    }
+    msg.body = body.to_vec(); msg.render()
 }
 
 fn version(v: Version) -> &'static str {
@@ -223,7 +282,6 @@ impl HttpHandler for Handler {
         self.id = crate::history::next_id();
         self.start = Instant::now();
         self.url = req.uri().to_string();
-        // ponytail: buffers whole bodies, so streaming bodies (SSE, long-poll) stall until done; stream-tee if it matters
         let (mut parts, body) = req.into_parts();
         let Ok(mut body) = body.collect().await.map(|c| c.to_bytes().to_vec()) else {
             return self.respond(StatusCode::BAD_GATEWAY, "ferrite: failed to read request body".into()).into();
@@ -236,6 +294,12 @@ impl HttpHandler for Handler {
         if let Some(r) = cfg.apply(&raw, true) {
             raw = r;
             changed = true;
+        }
+        if cfg.cfg.extensions.scripts.iter().any(|s| s.enabled && s.phase == "request") {
+            match crate::extensions::hooks(&cfg.cfg.extensions, "request", &self.url, raw.clone()).await {
+                Ok(edited) => { changed |= edited != raw; raw = edited; },
+                Err(e) => return self.respond(StatusCode::BAD_GATEWAY,e).into(),
+            }
         }
         let stop = cfg.cfg.intercept.requests && !(cfg.cfg.intercept.skip_static && http::is_static(&self.url));
         let edited = if cfg.intercepts(stop, &self.url) {
@@ -254,11 +318,60 @@ impl HttpHandler for Handler {
         if self.record {
             self.send(Event::Request { id: self.id, url: self.url.clone(), raw });
         }
-        Request::from_parts(parts, Body::from(body)).into()
+        let req = Request::from_parts(parts, Body::from(body));
+        if hyper_tungstenite::is_upgrade_request(&req) {
+            return self.websocket(req, _ctx.client_addr).await.into();
+        }
+        req.into()
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         let (mut parts, body) = res.into_parts();
+        let cfg = current(&self.shared);
+        let body_rules = cfg.cfg.rules.iter().any(|r| r.enabled && matches!(r.part, crate::rules::Part::ResponseBody));
+        let mods = &cfg.cfg.mods;
+        let needs_body = cfg.cfg.extensions.scripts.iter().any(|s| s.enabled && s.phase == "response") || body_rules || mods.unhide_hidden || mods.enable_disabled || mods.remove_maxlength || mods.remove_js_validation
+            || cfg.intercepts(cfg.cfg.intercept.responses, &self.url);
+        if !needs_body {
+            // Preserve streaming/backpressure, including SSE. Capture only bounded evidence.
+            let mut headers = parts.headers.clone();
+            headers.remove(hudsucker::hyper::header::TRANSFER_ENCODING);
+            let first = format!("{} {}", version(parts.version), parts.status);
+            let head_raw = render(first, &headers, &[]);
+            let raw = cfg.apply(&head_raw, false).unwrap_or(head_raw);
+            let modified = Msg::parse(&raw);
+            let length = parts.headers.get(CONTENT_LENGTH).cloned();
+            parts.headers = header_map(&modified.headers);
+            if let Some(length) = length { parts.headers.insert(CONTENT_LENGTH,length); }
+            let raw = render(format!("{} {}",version(parts.version),parts.status), &parts.headers, &[]);
+            let handler = self.clone();
+            let stream = hudsucker::futures::stream::unfold(
+                (body, Vec::new(), handler, raw, Instant::now(), false),
+                |(mut body, mut captured, handler, head, mut last, mut sent)| async move {
+                    loop {
+                        match body.frame().await {
+                            Some(Ok(frame)) => if let Ok(data) = frame.into_data() {
+                                let remaining = crate::retention::MESSAGE.saturating_sub(captured.len());
+                                captured.extend_from_slice(&data[..remaining.min(data.len())]);
+                                if handler.record && (!sent || last.elapsed().as_secs() >= 1) {
+                                    handler.send(Event::Response { id: handler.id, raw: captured_response(&head, &captured), ms: handler.start.elapsed().as_millis() });
+                                    last = Instant::now(); sent = true;
+                                }
+                                return Some((Ok::<_, hudsucker::Error>(data), (body, captured, handler, head, last, sent)));
+                            },
+                            Some(Err(error)) => return Some((Err(error), (body, captured, handler, head, last, sent))),
+                            None => {
+                                if handler.record {
+                                    handler.send(Event::Response { id: handler.id, raw: captured_response(&head, &captured), ms: handler.start.elapsed().as_millis() });
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                },
+            );
+            return Response::from_parts(parts, Body::from_stream(stream));
+        }
         let Ok(mut body) = body.collect().await.map(|c| c.to_bytes().to_vec()) else {
             return self.respond(StatusCode::BAD_GATEWAY, "ferrite: failed to read response body".into());
         };
@@ -278,6 +391,12 @@ impl HttpHandler for Handler {
         if let Some(r) = cfg.apply(&raw, false) {
             raw = r;
             changed = true;
+        }
+        if cfg.cfg.extensions.scripts.iter().any(|s| s.enabled && s.phase == "response") {
+            match crate::extensions::hooks(&cfg.cfg.extensions, "response", &self.url, raw.clone()).await {
+                Ok(edited) => { changed |= edited != raw; raw = edited; },
+                Err(e) => return self.respond(StatusCode::BAD_GATEWAY,e),
+            }
         }
         let edited = if cfg.intercepts(cfg.cfg.intercept.responses, &self.url) {
             self.intercept(Kind::Response, &self.url, raw.clone()).await
@@ -319,6 +438,12 @@ impl WebSocketHandler for Handler {
             WebSocketContext::ClientToServer { dst, .. } => (dst.to_string(), true),
             WebSocketContext::ServerToClient { src, .. } => (src.to_string(), false),
         };
+        self.websocket_message(url,outgoing,msg).await
+    }
+}
+
+impl Handler {
+    async fn websocket_message(&mut self, url: String, outgoing: bool, msg: Message) -> Option<Message> {
         let (mut data, text) = match &msg {
             Message::Text(t) => (t.as_bytes().to_vec(), true),
             Message::Binary(b) => (b.to_vec(), false),

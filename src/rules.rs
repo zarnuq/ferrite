@@ -85,6 +85,12 @@ pub struct Config {
     /// Record only in-scope traffic in history (still proxies everything).
     pub record_scope_only: bool,
     pub capture_cookies: bool,
+    pub resource_pools: Vec<crate::work::PoolConfig>,
+    pub identities: Vec<crate::authz::Identity>,
+    pub browser_steps: Vec<crate::browser_lab::Step>,
+    pub session_macros: Vec<crate::macros::Macro>,
+    pub extensions: crate::extensions::Package,
+    pub callback_base: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -119,6 +125,12 @@ impl Default for Config {
             theme: Theme::System,
             record_scope_only: false,
             capture_cookies: true,
+            resource_pools: vec![Default::default()],
+            identities: Vec::new(),
+            browser_steps: Vec::new(),
+            session_macros: Vec::new(),
+            extensions: Default::default(),
+            callback_base: String::new(),
         }
     }
 }
