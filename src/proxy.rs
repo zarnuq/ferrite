@@ -331,6 +331,7 @@ impl HttpHandler for Handler {
         let body_rules = cfg.cfg.rules.iter().any(|r| r.enabled && matches!(r.part, crate::rules::Part::ResponseBody));
         let mods = &cfg.cfg.mods;
         let needs_body = cfg.cfg.extensions.scripts.iter().any(|s| s.enabled && s.phase == "response") || body_rules || mods.unhide_hidden || mods.enable_disabled || mods.remove_maxlength || mods.remove_js_validation
+            || mods.remove_all_js || mods.remove_object_tags || mods.convert_https
             || cfg.intercepts(cfg.cfg.intercept.responses, &self.url);
         if !needs_body {
             // Preserve streaming/backpressure, including SSE. Capture only bounded evidence.

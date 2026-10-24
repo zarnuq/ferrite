@@ -50,6 +50,17 @@ const PAYLOAD_ENCODE: &AsciiSet =
 
 const MAX_REQUESTS: usize = 1_000_000;
 
+/// Built-in payload lists, bundled at compile time (no runtime files to install).
+const PRESETS: &[(&str, &str)] = &[
+    ("Fuzzing - quick", include_str!("../assets/payloads/fuzzing-quick.pay")),
+    ("SQL injection", include_str!("../assets/payloads/sql-injection.pay")),
+    ("XSS", include_str!("../assets/payloads/xss.pay")),
+    ("Path traversal", include_str!("../assets/payloads/path-traversal.pay")),
+    ("SSRF targets", include_str!("../assets/payloads/ssrf.pay")),
+    ("Usernames", include_str!("../assets/payloads/usernames.pay")),
+    ("Passwords", include_str!("../assets/payloads/passwords.pay")),
+];
+
 /// Stores the template and payload sets once, constructing requests only as workers need them.
 struct AttackPlan {
     parts: Vec<String>,
@@ -630,6 +641,13 @@ impl Intruder {
                 ui.add(egui::TextEdit::singleline(&mut self.suffix).desired_width(100.0));
             });
             ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("payload_preset").selected_text("Preset").show_ui(ui, |ui| {
+                    for (name, body) in PRESETS {
+                        if ui.selectable_label(false, *name).clicked() {
+                            self.sets[self.set] = body.trim_end().to_string();
+                        }
+                    }
+                });
                 ui.add(egui::TextEdit::singleline(&mut self.load_path).hint_text("/path/to/wordlist").desired_width(220.0));
                 if ui.button("Load file").clicked() {
                     match std::fs::read(&self.load_path) {

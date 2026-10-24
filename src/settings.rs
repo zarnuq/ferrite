@@ -83,6 +83,10 @@ pub fn ui(ui: &mut egui::Ui, cfg: &mut Config) {
         ui.checkbox(&mut cfg.mods.remove_maxlength, "Remove input field length limits");
         ui.checkbox(&mut cfg.mods.remove_js_validation, "Remove JavaScript and HTML5 form validation");
         ui.checkbox(&mut cfg.mods.strip_secure, "Remove Secure flag from cookies");
+        ui.checkbox(&mut cfg.mods.highlight_unhidden, "Highlight unhidden fields");
+        ui.checkbox(&mut cfg.mods.remove_all_js, "Remove all JavaScript");
+        ui.checkbox(&mut cfg.mods.remove_object_tags, "Remove <object>/<embed>/<applet> tags");
+        ui.checkbox(&mut cfg.mods.convert_https, "Convert HTTPS links to HTTP");
         ui.add_space(12.0);
 
         ui.heading("Match and replace");

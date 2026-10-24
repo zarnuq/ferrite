@@ -111,6 +111,10 @@ pub struct Mods {
     pub remove_maxlength: bool,
     pub remove_js_validation: bool,
     pub strip_secure: bool,
+    pub highlight_unhidden: bool,
+    pub remove_all_js: bool,
+    pub remove_object_tags: bool,
+    pub convert_https: bool,
 }
 
 impl Default for Config {
@@ -186,7 +190,9 @@ impl Compiled {
             .collect();
         let m = &cfg.mods;
         let mods = [
-            (m.unhide_hidden, Part::ResponseBody, r#"(?i)(<input\b[^>]*?\btype\s*=\s*["']?)hidden"#, "${1}text"),
+            (m.unhide_hidden && !m.highlight_unhidden, Part::ResponseBody, r#"(?i)(<input\b[^>]*?\btype\s*=\s*["']?)hidden"#, "${1}text"),
+            // Highlight supersedes plain unhide: also inject a visible background.
+            (m.unhide_hidden && m.highlight_unhidden, Part::ResponseBody, r#"(?i)(<input\b)([^>]*?\btype\s*=\s*["']?)hidden"#, r#"$1 style="background-color:#ffd700" ${2}text"#),
             (
                 m.enable_disabled,
                 Part::ResponseBody,
@@ -202,6 +208,15 @@ impl Compiled {
                 "$1",
             ),
             (m.strip_secure, Part::ResponseHeader, r"(?i)^(set-cookie:.*?);\s*secure\b", "$1"),
+            // Remove all JavaScript: script blocks and inline event handlers.
+            (m.remove_all_js, Part::ResponseBody, r"(?is)<script\b[^>]*>.*?</script>", ""),
+            (m.remove_all_js, Part::ResponseBody, r#"(?i)\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)"#, ""),
+            // Remove object/embed/applet tags (regex crate has no backrefs, so one per tag).
+            (m.remove_object_tags, Part::ResponseBody, r"(?is)<object\b[^>]*>.*?</object>", ""),
+            (m.remove_object_tags, Part::ResponseBody, r"(?is)<applet\b[^>]*>.*?</applet>", ""),
+            (m.remove_object_tags, Part::ResponseBody, r"(?i)<embed\b[^>]*>", ""),
+            // Convert https:// links to http:// (SSL-stripping test).
+            (m.convert_https, Part::ResponseBody, r"(?i)https://", "http://"),
         ];
         for (on, part, find, rep) in mods {
             if on {
@@ -312,12 +327,25 @@ mod tests {
         );
         assert!(c.apply(b"HTTP/1.1 200 OK\r\n\r\nabc", false).is_none());
 
-        let mods = Mods { unhide_hidden: true, enable_disabled: true, remove_maxlength: true, remove_js_validation: true, strip_secure: true };
+        let mods = Mods { unhide_hidden: true, enable_disabled: true, remove_maxlength: true, remove_js_validation: true, strip_secure: true, ..Default::default() };
         let c = Compiled::new(Config { mods, passthrough: vec!["google".into()], ..Config::default() });
         let html = b"HTTP/1.1 200 OK\r\nSet-Cookie: s=1; Secure; HttpOnly\r\n\r\n<form onsubmit=\"return v()\"><input type=hidden name=a><input name=b disabled maxlength=3 required></form>";
         let out = String::from_utf8(c.apply(html, false).unwrap()).unwrap();
         assert!(out.contains("Set-Cookie: s=1; HttpOnly"), "{out}");
         assert!(out.ends_with("<form><input type=text name=a><input name=b></form>"), "{out}");
         assert!(c.passthrough("www.google.com") && !c.passthrough("example.com"));
+
+        // New mods: remove all JS, remove object/embed, convert https, highlight unhidden.
+        let mods = Mods { remove_all_js: true, remove_object_tags: true, convert_https: true, unhide_hidden: true, highlight_unhidden: true, ..Default::default() };
+        let c = Compiled::new(Config { mods, ..Config::default() });
+        let html = br#"HTTP/1.1 200 OK
+
+<script>evil()</script><a href="https://x/" onclick="go()">l</a><object data=x></object><embed src=y><input type="hidden" name=t>"#;
+        let out = String::from_utf8(c.apply(html, false).unwrap()).unwrap();
+        assert!(!out.contains("<script"), "{out}");
+        assert!(!out.contains("onclick"), "{out}");
+        assert!(!out.contains("<object") && !out.contains("<embed"), "{out}");
+        assert!(out.contains("http://x/") && !out.contains("https://x/"), "{out}");
+        assert!(out.contains(r#"style="background-color:#ffd700""#) && out.contains("type=\"text\""), "{out}");
     }
 }
